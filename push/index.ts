@@ -352,6 +352,14 @@ for (const compressedDigest of compressedDigests) {
   );
 }
 
+const task = await Promise.allSettled(tasks);
+for (const t of task) {
+  if (t.status === "rejected") {
+    console.log('failed to push to registry')
+    process.exit(1)
+  }
+}
+
 pushTasks.push(
   pool(async () => {
     await pushLayer(
