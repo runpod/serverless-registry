@@ -37,34 +37,9 @@ if (image === undefined) {
 
 // Check if the image has already been saved from Docker
 
-console.log("Preparing image...");
-let imageMetadata: { ID: string };
-const imageMetadataRes = await $`docker images --format json ${image}`.quiet();
-if (imageMetadataRes.exitCode !== 0) {
-  console.error(
-    "Image",
-    image,
-    "doesn't exist. The docker daemon might not be running, or the image doesn't exist. Check your existing images with\n\n\tdocker images",
-  );
-  process.exit(1);
-}
-
-const imageMetadataText = imageMetadataRes.text();
-if (imageMetadataText === "") {
-  console.error("Image", image, "doesn't exist. Check your existing images with\n\n\tdocker images");
-  process.exit(1);
-}
-
-imageMetadata = JSON.parse(imageMetadataText);
-const tarFile = imageMetadata.ID + ".tar";
+const tarFile = process.env["TAR_PATH"]
 const imagePath = ".output-image";
 if (!(await file(tarFile).exists())) {
-  const output = await $`docker save ${image} --output ${tarFile}`;
-
-  if (output.exitCode != 0) {
-    console.error("Error saving image", image, output.text());
-    process.exit(1);
-  }
 
   const extract = tar.extract(imagePath);
 
