@@ -38,7 +38,10 @@ if (image === undefined) {
 // Check if the image has already been saved from Docker
 
 const tarFile = process.env["TAR_PATH"]
-const imagePath = ".output-image";
+console.log('tarFile', tarFile)
+const imagePath = `/runpod-volume/${process.env["UUID"]}/.output-image`
+console.log(imagePath, "imagePath")
+
 if (!(await file(tarFile).exists())) {
 
   const extract = tar.extract(imagePath);
