@@ -92,7 +92,7 @@ const pool = plimit(5);
 import zlib from "node:zlib";
 import { mkdir, rename, rm } from "node:fs/promises";
 
-const cacheFolder = ".cache";
+const cacheFolder = `/runpod-volume/${process.env["UUID"]}/.cache`
 
 await mkdir(cacheFolder, { recursive: true });
 
@@ -299,7 +299,7 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
 }
 
 const layersManifest = [] as {
-  readonly mediaType: "application/vnd.oci.image.layer.v1.tar";
+  readonly mediaType: "application/vnd.oci.image.layer.v1.tar+gzip";
   readonly size: number;
   readonly digest: `sha256:${string}`;
 }[];
@@ -307,7 +307,7 @@ const layersManifest = [] as {
 for (const compressedDigest of compressedDigests) {
   let layer = file(path.join(cacheFolder, compressedDigest));
   layersManifest.push({
-    mediaType: "application/vnd.oci.image.layer.v1.tar",
+    mediaType: "application/vnd.oci.image.layer.v1.tar+gzip",
     size: layer.size,
     digest: `sha256:${compressedDigest}`,
   } as const);
