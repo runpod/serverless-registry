@@ -102,7 +102,7 @@ const tasks = [];
 
 console.log("compressing...");
 // Iterate through every layer, read it and compress to a file
-for (const layer of manifest.Layers) {
+for (let layer of manifest.Layers) {
   tasks.push(
     pool(async () => {
       let layerPath = path.join(imagePath, layer);
@@ -126,6 +126,7 @@ for (const layer of manifest.Layers) {
             console.error('An error occurred:', err);
           })
         layerPath = tempLayerPath
+        layer = layer.replace(".tar.gz", ".tar")
       }
 
       let layerName = layer.endsWith(".tar") ? path.dirname(layer) : path.basename(layer);
