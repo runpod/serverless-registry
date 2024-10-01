@@ -192,6 +192,7 @@ const tag =
 import fetchNode from "node-fetch";
 import { ReadableLimiter } from "./limiter";
 
+console.log(`Basic ${btoa(`${username}:${password}`))
 const cred = `Basic ${btoa(`${username}:${password}`)}`;
 
 console.log("Starting push to remote");
