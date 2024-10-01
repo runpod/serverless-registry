@@ -1,5 +1,6 @@
 import { $, CryptoHasher, file, write } from "bun";
 import tar from "tar-fs";
+import fs from "node:fs"
 
 import stream from "node:stream";
 
@@ -110,6 +111,23 @@ for (const layer of manifest.Layers) {
       //   2. <layer>/layer.tar
       //
       // This handles both cases.
+      if (layer.endsWith(".tar.gz")) {
+        const tempLayerPath = path.join(imagePath, layer.replace(".tar.gz", ".tar"))
+        const readStream = fs.createReadStream(layerPath)
+        const writeStream = fs.createWriteStream(tempLayerPath)
+        const gunzip = zlib.createGunzip()
+        readStream
+          .pipe(gunzip)
+          .pipe(writeStream)
+          .on('finish', () => {
+            console.log('File successfully decompressed to .tar');
+          })
+          .on('error', (err) => {
+            console.error('An error occurred:', err);
+          })
+        layerPath = tempLayerPath
+      }
+
       let layerName = layer.endsWith(".tar") ? path.dirname(layer) : path.basename(layer);
 
       const layerCachePath = path.join(cacheFolder, layerName + "-ptr");
