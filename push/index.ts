@@ -42,7 +42,7 @@ console.log('tarFile', tarFile)
 const imagePath = `/runpod-volume/${process.env["UUID"]}/.output-image`
 console.log(imagePath, "imagePath")
 
-if (!(await file(tarFile).exists())) {
+if ((await file(tarFile).exists())) {
 
   const extract = tar.extract(imagePath);
 
