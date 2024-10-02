@@ -230,6 +230,7 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
   });
 
   if (!layerExistsResponse.ok && layerExistsResponse.status !== 404) {
+    console.log(await layerExistsResponse.text())
     throw new Error(`${layerExistsURL} responded ${layerExistsResponse.status}: ${await layerExistsResponse.text()}`);
   }
 
@@ -244,6 +245,7 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
     method: "POST",
   });
   if (!createUploadResponse.ok) {
+    console.log(await createUploadResponse.text())
     throw new Error(
       `${createUploadURL} responded ${createUploadResponse.status}: ${await createUploadResponse.text()}`,
     );
@@ -283,6 +285,7 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
       }),
     });
     if (!putChunkResult.ok) {
+      console.log(await putChunkResult.text())
       throw new Error(
         `uploading chunk ${putChunkUploadURL} returned ${putChunkResult.status}: ${await putChunkResult.text()}`,
       );
@@ -290,6 +293,7 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
 
     const rangeResponse = putChunkResult.headers.get("range");
     if (rangeResponse !== range) {
+      console.log(await putChunkResult.text())
       throw new Error(`unexpected Range header ${rangeResponse}, expected ${range}`);
     }
 
@@ -313,7 +317,8 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
     }),
   });
   if (!response.ok) {
-    throw new Error(`${uploadURL.toString()} failed with ${response.status}: ${await response.text()}`);
+    console.log(await response.text())
+    throw new Error(`${uploadURL.toString()} failed with ${response.status}`);
   }
 
   console.log("Pushed", layerDigest);
@@ -402,6 +407,7 @@ const responseManifestUpload = await fetch(manifestUploadURL, {
 });
 
 if (!responseManifestUpload.ok) {
+  console.log(await responseManifestUpload.text())
   throw new Error(
     `manifest upload ${manifestUploadURL} returned ${
       responseManifestUpload.status
