@@ -88,6 +88,8 @@ if (manifests.length > 1) {
   console.warn("Manifest resolved to multiple images, picking the first one");
 }
 
+console.log('manifests', manifests)
+
 import plimit from "p-limit";
 const pool = plimit(5);
 import zlib from "node:zlib";
