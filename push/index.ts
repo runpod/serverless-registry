@@ -120,6 +120,7 @@ for (const layer of manifest.Layers) {
       //
       // This handles both cases.
       if (layer.endsWith(".tar.gz")) {
+        console.log("file name ends with .tar.gz");
         const readStream = Bun.file(layerPath).stream();
         const hasher = new CryptoHasher("sha256");
         for await (const chunk of readStream) {
