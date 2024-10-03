@@ -114,12 +114,26 @@ for (const layer of manifest.Layers) {
       // This handles both cases.
       if (layer.endsWith(".tar.gz")) {
         console.log("file name ends with .tar.gz");
+        const baseName = layer.replace(".tar.gz", "");
+        console.log(baseName)
+        const layerInProgressPath = path.join(cacheFolder, baseName + "-in-progress");
+        await rm(layerInProgressPath, { recursive: true });
+
         const readStream = Bun.file(layerPath).stream();
+        const writeStream = Bun.file(layerInProgressPath).writer()
         const hasher = new CryptoHasher("sha256");
         for await (const chunk of readStream) {
           hasher.update(chunk);
+          writeStream.write(chunk);
         }
+
+        await writeStream.flush();
+        await writeStream.end();
+
         const digest = hasher.digest("hex");
+        const layerCachePath = path.join(cacheFolder, baseName + "-ptr");
+        await write(layerCachePath, digest);
+        await rename(layerInProgressPath, path.join(cacheFolder, digest));
         return digest;
       } else {
         let layerName = layer.endsWith(".tar") ? path.dirname(layer) : path.basename(layer);
