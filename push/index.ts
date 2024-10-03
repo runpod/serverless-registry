@@ -389,7 +389,10 @@ pushTasks.push(
 
 const promises = await Promise.allSettled(pushTasks);
 for (const promise of promises) {
-  if (promise.status === "rejected") process.exit(1);
+  if (promise.status === "rejected") {
+    console.error(await promise.reason)
+    process.exit(1);
+  }
 }
 
 const manifestObject = {
