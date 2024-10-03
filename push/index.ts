@@ -1,5 +1,6 @@
 import { $, CryptoHasher, file, write } from "bun";
 import tar from "tar-fs";
+import fs from "node:fs";
 
 import stream from "node:stream";
 
@@ -37,15 +38,7 @@ if (image === undefined) {
 
 // Check if the image has already been saved from Docker
 
-console.log("Preparing image...");
-
-const imageID = process?.env?.["UUID"] ?? "";
-if (imageID === "") {
-  console.error("Image", image, "doesn't exist. Check your existing images with\n\n\tdocker images");
-  process.exit(1);
-}
-
-const tarFile = process.env["TAR_PATH"] ?? "";
+const tarFile = process.env["TAR_PATH"];
 console.log("tarFile", tarFile);
 const imagePath = `/runpod-volume/${process.env["UUID"]}/.output-image`;
 console.log(imagePath, "imagePath");
@@ -94,19 +87,19 @@ if (manifests.length > 1) {
   console.warn("Manifest resolved to multiple images, picking the first one");
 }
 
+console.log("manifests", manifests);
+
 import plimit from "p-limit";
 const pool = plimit(5);
 import zlib from "node:zlib";
 import { mkdir, rename, rm } from "node:fs/promises";
 
-const cacheFolder = ".cache";
+const cacheFolder = `/runpod-volume/${process.env["UUID"]}/.cache`;
 
 await mkdir(cacheFolder, { recursive: true });
 
 const [manifest] = manifests;
 const tasks = [];
-
-console.log(manifest, "manifest")
 
 console.log("compressing...");
 // Iterate through every layer, read it and compress to a file
@@ -190,6 +183,7 @@ for (const layer of manifest.Layers) {
   );
 }
 
+
 const configManifest = path.join(imagePath, manifest.Config);
 const config = await file(configManifest).text();
 const configDigest = new CryptoHasher("sha256").update(config).digest("hex");
@@ -212,6 +206,7 @@ const tag =
 import fetchNode from "node-fetch";
 import { ReadableLimiter } from "./limiter";
 
+console.log(`Basic ${btoa(`${username}:${password}`)}`);
 const cred = `Basic ${btoa(`${username}:${password}`)}`;
 
 console.log("Starting push to remote");
@@ -228,6 +223,7 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
   });
 
   if (!layerExistsResponse.ok && layerExistsResponse.status !== 404) {
+    console.log(await layerExistsResponse.text());
     throw new Error(`${layerExistsURL} responded ${layerExistsResponse.status}: ${await layerExistsResponse.text()}`);
   }
 
@@ -242,12 +238,13 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
     method: "POST",
   });
   if (!createUploadResponse.ok) {
+    console.log(await createUploadResponse.text());
     throw new Error(
       `${createUploadURL} responded ${createUploadResponse.status}: ${await createUploadResponse.text()}`,
     );
   }
 
-  const maxChunkLength = +(createUploadResponse.headers.get("oci-chunk-max-length") ?? 100 * 1024 * 1024);
+  const maxChunkLength = +(createUploadResponse.headers.get("oci-chunk-max-length") ?? 500 * 1024 * 1024);
   if (isNaN(maxChunkLength)) {
     throw new Error(`oci-chunk-max-length header is malformed (not a number)`);
   }
@@ -281,6 +278,7 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
       }),
     });
     if (!putChunkResult.ok) {
+      console.log(await putChunkResult.text());
       throw new Error(
         `uploading chunk ${putChunkUploadURL} returned ${putChunkResult.status}: ${await putChunkResult.text()}`,
       );
@@ -288,6 +286,7 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
 
     const rangeResponse = putChunkResult.headers.get("range");
     if (rangeResponse !== range) {
+      console.log(await putChunkResult.text());
       throw new Error(`unexpected Range header ${rangeResponse}, expected ${range}`);
     }
 
@@ -311,7 +310,8 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
     }),
   });
   if (!response.ok) {
-    throw new Error(`${uploadURL.toString()} failed with ${response.status}: ${await response.text()}`);
+    console.log(await response.text());
+    throw new Error(`${uploadURL.toString()} failed with ${response.status}`);
   }
 
   console.log("Pushed", layerDigest);
@@ -330,7 +330,7 @@ for (const compressedDigest of compressedDigests) {
     size: layer.size,
     digest: `sha256:${compressedDigest}`,
   } as const);
-  pushTasks.push(
+  tasks.push(
     pool(async () => {
       const maxRetries = +(process.env["MAX_RETRIES"] ?? 3);
       if (isNaN(maxRetries)) throw new Error("MAX_RETRIES is not a number");
@@ -350,6 +350,14 @@ for (const compressedDigest of compressedDigests) {
   );
 }
 
+const task = await Promise.allSettled(tasks);
+for (const t of task) {
+  if (t.status === "rejected") {
+    console.log("failed to push to registry");
+    process.exit(1);
+  }
+}
+
 pushTasks.push(
   pool(async () => {
     await pushLayer(
@@ -367,9 +375,7 @@ pushTasks.push(
 
 const promises = await Promise.allSettled(pushTasks);
 for (const promise of promises) {
-  if (promise.status === "rejected") {
-    throw promise.reason;
-  }
+  if (promise.status === "rejected") process.exit(1);
 }
 
 const manifestObject = {
@@ -394,6 +400,7 @@ const responseManifestUpload = await fetch(manifestUploadURL, {
 });
 
 if (!responseManifestUpload.ok) {
+  console.log(await responseManifestUpload.text());
   throw new Error(
     `manifest upload ${manifestUploadURL} returned ${
       responseManifestUpload.status
