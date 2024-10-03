@@ -391,6 +391,7 @@ const promises = await Promise.allSettled(pushTasks);
 for (const promise of promises) {
   if (promise.status === "rejected") {
     console.error(await promise.reason)
+    console.error("errored while pushing to registry")
     process.exit(1);
   }
 }
