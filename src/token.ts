@@ -170,12 +170,6 @@ export class RegistryTokens implements Authenticator {
           );
           return { verified: false, payload: null };
         }
-        if (!request.url.endsWith(payload?.imageName)) {
-          console.warn(
-            `verifyToken: failed jwt verification: image name ${payload?.imageName} does not match the token's image name in ${request.url}`,
-          )
-          return { verified: false, payload: null };
-        }
         break;
       default:
         return { verified: false, payload: null };
