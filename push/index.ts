@@ -239,7 +239,7 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
 
   if (!layerExistsResponse.ok && layerExistsResponse.status !== 404) {
     console.log(await layerExistsResponse.text());
-    throw new Error(`${layerExistsURL} responded ${layerExistsResponse.status}: ${await layerExistsResponse.text()}`);
+    throw new Error(`${layerExistsURL} responded ${layerExistsResponse.status}`);
   }
 
   if (layerExistsResponse.ok) {
@@ -255,7 +255,7 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
   if (!createUploadResponse.ok) {
     console.log(await createUploadResponse.text());
     throw new Error(
-      `${createUploadURL} responded ${createUploadResponse.status}: ${await createUploadResponse.text()}`,
+      `${createUploadURL} responded ${createUploadResponse.status}`,
     );
   }
 
@@ -295,7 +295,7 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
     if (!putChunkResult.ok) {
       console.log(await putChunkResult.text());
       throw new Error(
-        `uploading chunk ${putChunkUploadURL} returned ${putChunkResult.status}: ${await putChunkResult.text()}`,
+        `uploading chunk ${putChunkUploadURL} returned ${putChunkResult.status}`,
       );
     }
 
@@ -423,7 +423,7 @@ if (!responseManifestUpload.ok) {
   throw new Error(
     `manifest upload ${manifestUploadURL} returned ${
       responseManifestUpload.status
-    }: ${await responseManifestUpload.text()}`,
+    }`,
   );
 }
 console.log(manifestObject);
