@@ -134,6 +134,7 @@ for (const layer of manifest.Layers) {
         const layerCachePath = path.join(cacheFolder, baseName + "-ptr");
         await write(layerCachePath, digest);
         await rename(layerInProgressPath, path.join(cacheFolder, digest));
+        console.log("compression for 1 layer done")
         return digest;
       } else {
         let layerName = layer.endsWith(".tar") ? path.dirname(layer) : path.basename(layer);
