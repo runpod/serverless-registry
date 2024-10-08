@@ -38,7 +38,7 @@ if (image === undefined) {
 
 // Check if the image has already been saved from Docker
 
-const tarFile = process.env["TAR_PATH"];
+const tarFile = process.env["TAR_PATH"] ?? "";
 console.log("tarFile", tarFile);
 const imagePath = `/runpod-volume/${process.env["UUID"]}/.output-image`;
 console.log(imagePath, "imagePath");
@@ -86,8 +86,7 @@ if (manifests.length == 0) {
 if (manifests.length > 1) {
   console.warn("Manifest resolved to multiple images, picking the first one");
 }
-
-console.log("manifests", manifests);
+console.log("opened manifest")
 
 import plimit from "p-limit";
 const pool = plimit(5);

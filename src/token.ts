@@ -95,7 +95,6 @@ export class RegistryTokens implements Authenticator {
       // the JWT signature is valid, decode it now
       const decoded = jwt.decode(token);
       const payload = decoded.payload as RegistryAuthProtocolTokenPayload;
-      console.log(payload, "payload");
       return this.verifyPayload(request, payload);
     } catch (error) {
       // If the verification fails (e.g., due to token expiration or signature mismatch),
@@ -116,7 +115,6 @@ export class RegistryTokens implements Authenticator {
       console.warn(`verifyV0Token: failed jwt verification: the token has expired`);
       return { verified: false, payload: null };
     }
-    console.log(payload, request);
     // ensure capabilities are satisfied
     switch (request.method) {
       // PULL or PUSH methods
