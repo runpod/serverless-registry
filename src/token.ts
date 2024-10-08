@@ -7,9 +7,9 @@ import {
   Authenticator,
 } from "./auth";
 
-export function importKeyFromBase64(key: string): JsonWebKey {
+export function importKeyFromBase64(key: string): string {
   // Decodes the base64 value and performs unicode normalization.
-  return JSON.parse(decode(key));
+  return decode(key);
 }
 
 export async function newRegistryTokens(jwtPublicKey: string): Promise<RegistryTokens> {
@@ -17,10 +17,10 @@ export async function newRegistryTokens(jwtPublicKey: string): Promise<RegistryT
 }
 
 export class RegistryTokens implements Authenticator {
-  private jwtPublicKey: JsonWebKey;
+  private jwtPublicKey: string;
   authmode: string;
 
-  constructor(jwtPublicKey: JsonWebKey) {
+  constructor(jwtPublicKey: string) {
     this.authmode = "RegistryTokens";
     this.jwtPublicKey = jwtPublicKey;
   }
@@ -68,7 +68,7 @@ export class RegistryTokens implements Authenticator {
     };
 
     const token = await jwt.sign(tokenPayload, privateKey, {
-      algorithm: "ES256",
+      algorithm: "RS256",
     });
 
     return token;
@@ -87,7 +87,7 @@ export class RegistryTokens implements Authenticator {
   }> {
     try {
       // first verify the JWT
-      if (!(await jwt.verify(token, this.jwtPublicKey, { algorithm: "ES256" }))) {
+      if (!(await jwt.verify(token, this.jwtPublicKey, { algorithm: "RS256" }))) {
         console.warn("verifyToken: jwt.verify() failed");
         return { verified: false, payload: null };
       }
@@ -95,6 +95,7 @@ export class RegistryTokens implements Authenticator {
       // the JWT signature is valid, decode it now
       const decoded = jwt.decode(token);
       const payload = decoded.payload as RegistryAuthProtocolTokenPayload;
+      console.log(payload, "payload");
       return this.verifyPayload(request, payload);
     } catch (error) {
       // If the verification fails (e.g., due to token expiration or signature mismatch),
@@ -115,7 +116,7 @@ export class RegistryTokens implements Authenticator {
       console.warn(`verifyV0Token: failed jwt verification: the token has expired`);
       return { verified: false, payload: null };
     }
-
+    console.log(payload, request);
     // ensure capabilities are satisfied
     switch (request.method) {
       // PULL or PUSH methods
@@ -127,10 +128,10 @@ export class RegistryTokens implements Authenticator {
           );
           return { verified: false, payload: null };
         }
-        if (!request.url.endsWith(payload?.imageName)) {
+        if (!checkHasPermissionToImage(payload, request)) {
           console.warn(
             `verifyToken: failed jwt verification: image name ${payload?.imageName} does not match the token's image name in ${request.url}`,
-          )
+          );
           return { verified: false, payload: null };
         }
         break;
@@ -151,16 +152,28 @@ export class RegistryTokens implements Authenticator {
           );
           return { verified: false, payload: null };
         }
-        if (!request.url.endsWith(payload?.imageName)) {
+        if (!checkHasPermissionToImage(payload, request)) {
           console.warn(
             `verifyToken: failed jwt verification: image name ${payload?.imageName} does not match the token's image name in ${request.url}`,
-          )
+          );
           return { verified: false, payload: null };
         }
         break;
 
       // PUSH methods
       case "POST":
+        if (!payload.capabilities.includes("push")) {
+          console.warn(
+            `verifyToken: failed jwt verification: missing "push" capability for ${request.method} HTTP method`,
+          );
+          return { verified: false, payload: null };
+        }
+        if (!checkHasPermissionToImage(payload, request)) {
+          console.warn(
+            `verifyToken: failed jwt verification: image name ${payload?.imageName} does not match the token's image name in ${request.url}`,
+          );
+          return { verified: false, payload: null };
+        }
       case "PUT":
       case "DELETE":
       case "PATCH":
@@ -170,6 +183,7 @@ export class RegistryTokens implements Authenticator {
           );
           return { verified: false, payload: null };
         }
+        s
         break;
       default:
         return { verified: false, payload: null };
@@ -186,8 +200,21 @@ export class RegistryTokens implements Authenticator {
     if ("verified" in res) {
       return res;
     }
-
     const [, password] = res;
     return this.verifyToken(request, password);
   }
 }
+
+const checkHasPermissionToImage = (payload: RegistryAuthProtocolTokenPayload, request: Request) => {
+  const split = request.url.split("/");
+  let hasImageName = false;
+  for (const part of split) {
+    if (part === payload?.imageName) {
+      hasImageName = true;
+    }
+  }
+  if (!hasImageName) {
+    return false;
+  }
+  return true;
+};
