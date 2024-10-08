@@ -112,7 +112,6 @@ for (const layer of manifest.Layers) {
       //
       // This handles both cases.
       if (layer.endsWith(".tar.gz")) {
-        console.log("file name ends with .tar.gz");
         const baseName = layer.replace(".tar.gz", "");
         console.log(baseName)
         const layerInProgressPath = path.join(cacheFolder, baseName + "-in-progress");
