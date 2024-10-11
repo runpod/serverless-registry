@@ -181,7 +181,6 @@ export class RegistryTokens implements Authenticator {
           );
           return { verified: false, payload: null };
         }
-        s
         break;
       default:
         return { verified: false, payload: null };
