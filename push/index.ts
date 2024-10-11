@@ -21,7 +21,7 @@ if (process.stdin.isTTY) {
   );
 } else {
   password = process.env["REGISTRY_JWT_TOKEN"]
-  console.log(password)
+  console.log("password", password)
 }
 
 if (!username || !password) {
