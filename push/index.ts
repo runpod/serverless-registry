@@ -20,7 +20,6 @@ if (process.stdin.isTTY) {
   );
 } else {
   password = process.env["REGISTRY_JWT_TOKEN"]
-  console.log("password", password)
 }
 
 if (!username || !password) {
@@ -39,9 +38,7 @@ if (image === undefined) {
 // Check if the image has already been saved from Docker
 
 const tarFile = process.env["TAR_PATH"] ?? "";
-console.log("tarFile", tarFile);
 const imagePath = `/runpod-volume/${process.env["UUID"]}/.output-image`;
-console.log(imagePath, "imagePath");
 
 if (await file(tarFile).exists()) {
   const extract = tar.extract(imagePath);
@@ -113,7 +110,6 @@ for (const layer of manifest.Layers) {
       // This handles both cases.
       if (layer.endsWith(".tar.gz")) {
         const baseName = layer.replace(".tar.gz", "");
-        console.log(baseName)
         const layerInProgressPath = path.join(cacheFolder, baseName + "-in-progress");
         await rm(layerInProgressPath, { recursive: true });
 
