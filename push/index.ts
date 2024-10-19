@@ -39,6 +39,8 @@ if (image === undefined) {
 
 const tarFile = process.env["TAR_PATH"] ?? "";
 const imagePath = `/runpod-volume/${process.env["UUID"]}/.output-image`;
+console.log("tarFile", tarFile);
+console.log("imagePath", imagePath);
 
 if (await file(tarFile).exists()) {
   const extract = tar.extract(imagePath);
