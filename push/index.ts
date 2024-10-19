@@ -227,6 +227,7 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
     authorization: cred,
   });
   const layerExistsURL = `${proto}://${imageHost}/v2${imageRepositoryPath}/blobs/${layerDigest}`;
+  console.log("HEAD")
   const layerExistsResponse = await fetch(layerExistsURL, {
     headers,
     method: "HEAD",
@@ -243,6 +244,7 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
   }
 
   const createUploadURL = `${proto}://${imageHost}/v2${imageRepositoryPath}/blobs/uploads/`;
+  console.log("POST")
   const createUploadResponse = await fetch(createUploadURL, {
     headers,
     method: "POST",
@@ -276,6 +278,7 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
     const range = `0-${Math.min(end, totalLayerSize) - 1}`;
     const current = new ReadableLimiter(reader as ReadableStreamDefaultReader, maxToWrite, previousReadable);
 
+    console.log("PATCH")
     // we have to do fetchNode because Bun doesn't allow setting custom Content-Length.
     // https://github.com/oven-sh/bun/issues/10507
     const putChunkResult = await fetchNode(putChunkUploadURL, {
@@ -311,7 +314,7 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
   const range = `0-${written - 1}`;
   const uploadURL = new URL(`${proto}://${imageHost}${location}`);
   uploadURL.searchParams.append("digest", layerDigest);
-
+  console.log("PUT")
   const response = await fetch(uploadURL.toString(), {
     method: "PUT",
     headers: new Headers({
@@ -404,6 +407,7 @@ const manifestObject = {
 } as const;
 
 const manifestUploadURL = `${proto}://${imageHost}/v2${imageRepositoryPath}/manifests/${tag}`;
+console.log("PUT")
 const responseManifestUpload = await fetch(manifestUploadURL, {
   headers: {
     "authorization": cred,
