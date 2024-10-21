@@ -256,7 +256,7 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
     );
   }
 
-  const maxChunkLength = +(createUploadResponse.headers.get("oci-chunk-max-length") ?? 500 * 1024 * 1024);
+  const maxChunkLength = +(createUploadResponse.headers.get("oci-chunk-max-length") ?? 100 * 1024 * 1024);
   if (isNaN(maxChunkLength)) {
     throw new Error(`oci-chunk-max-length header is malformed (not a number)`);
   }
@@ -279,15 +279,15 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
     const current = new ReadableLimiter(reader as ReadableStreamDefaultReader, maxToWrite, previousReadable);
 
     // TODO: remove this later
-    if (totalLayerSizeLeft > 100000000 * 5) {
-      console.log("maxChunkLength < totalLayerSizeLeft. skipping", maxChunkLength, totalLayerSizeLeft)
-      previousReadable = current;
-      totalLayerSizeLeft -= 100000000;
-      written += 100000000;
-      end += 100000000;
-      if (totalLayerSizeLeft != 0) console.log(layerDigest + ":", totalLayerSizeLeft, "upload bytes left.");
-      continue;
-    }
+    // if (totalLayerSizeLeft > 100000000 * 5) {
+    //   console.log("maxChunkLength < totalLayerSizeLeft. skipping", maxChunkLength, totalLayerSizeLeft)
+    //   previousReadable = current;
+    //   totalLayerSizeLeft -= 100000000;
+    //   written += 100000000;
+    //   end += 100000000;
+    //   if (totalLayerSizeLeft != 0) console.log(layerDigest + ":", totalLayerSizeLeft, "upload bytes left.");
+    //   continue;
+    // }
 
     console.log("PATCH")
     // we have to do fetchNode because Bun doesn't allow setting custom Content-Length.
