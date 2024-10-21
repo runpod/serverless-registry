@@ -278,12 +278,13 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
     const range = `0-${Math.min(end, totalLayerSize) - 1}`;
     const current = new ReadableLimiter(reader as ReadableStreamDefaultReader, maxToWrite, previousReadable);
 
+    // TODO: remove this later
     if (maxChunkLength < totalLayerSizeLeft) {
       console.log("maxChunkLength < totalLayerSizeLeft. skipping", maxChunkLength, totalLayerSizeLeft)
       previousReadable = current;
-      totalLayerSizeLeft -= previousReadable.written;
-      written += previousReadable.written;
-      end += previousReadable.written;
+      totalLayerSizeLeft -= 100000000;
+      written += 100000000;
+      end += 100000000;
       if (totalLayerSizeLeft != 0) console.log(layerDigest + ":", totalLayerSizeLeft, "upload bytes left.");
       continue;
     }
