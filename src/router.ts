@@ -330,6 +330,7 @@ v2Router.post("/:name+/blobs/uploads/", async (req, env: Env) => {
   const { name } = req.params;
   const [uploadObject, err] = await wrap<UploadObject | RegistryError, Error>(env.REGISTRY_CLIENT.startUpload(name));
   if (err) {
+    console.log("error", errorString(err))
     return new InternalError();
   }
 
@@ -362,6 +363,7 @@ v2Router.get("/:name+/blobs/uploads/:uuid", async (req, env: Env) => {
     env.REGISTRY_CLIENT.getUpload(name, uuid),
   );
   if (err) {
+    console.log("error", errorString(err))
     return new InternalError();
   }
 
@@ -438,6 +440,7 @@ v2Router.put("/:name+/blobs/uploads/:uuid", async (req, env: Env) => {
   const { digest } = req.query;
 
   const url = new URL(req.url);
+  console.log(req.body ? JSON.stringify(req.body) : undefined, "request body")
   const [res, err] = await wrap<FinishedUploadObject | RegistryError, Error>(
     env.REGISTRY_CLIENT.finishUpload(
       name,
@@ -450,6 +453,7 @@ v2Router.put("/:name+/blobs/uploads/:uuid", async (req, env: Env) => {
   );
 
   if (err) {
+    console.log("finish upload error", errorString(err), JSON.stringify(req.body))
     return new InternalError();
   }
 

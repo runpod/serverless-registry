@@ -25,7 +25,6 @@ export interface Authenticator {
 export function stripUsernamePasswordFromHeader(r: Request): [string, string] | { verified: false; payload: null } {
   // first check if we have an Authorization header, this is the basis for all auth stuff in our registry
   const authorization = r.headers.get("Authorization") ?? "";
-  console.log(JSON.stringify(r), "authorization")
   if (!authorization) {
     // missing authorization header
     // do not log this. the /v2/ sends this request without any credentials to do version checking

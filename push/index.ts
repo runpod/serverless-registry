@@ -278,9 +278,20 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
     const range = `0-${Math.min(end, totalLayerSize) - 1}`;
     const current = new ReadableLimiter(reader as ReadableStreamDefaultReader, maxToWrite, previousReadable);
 
+    if (maxChunkLength < totalLayerSizeLeft) {
+      console.log("maxChunkLength < totalLayerSizeLeft. skipping", maxChunkLength, totalLayerSizeLeft)
+      previousReadable = current;
+      totalLayerSizeLeft -= previousReadable.written;
+      written += previousReadable.written;
+      end += previousReadable.written;
+      if (totalLayerSizeLeft != 0) console.log(layerDigest + ":", totalLayerSizeLeft, "upload bytes left.");
+      continue;
+    }
+
     console.log("PATCH")
     // we have to do fetchNode because Bun doesn't allow setting custom Content-Length.
     // https://github.com/oven-sh/bun/issues/10507
+
     const putChunkResult = await fetchNode(putChunkUploadURL, {
       method: "PATCH",
       body: current,

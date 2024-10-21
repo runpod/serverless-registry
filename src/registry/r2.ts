@@ -650,6 +650,7 @@ export class R2Registry implements Registry {
     length?: number | undefined,
   ): Promise<RegistryError | FinishedUploadObject> {
     const urlObject = new URL("https://r2-registry.com" + location);
+    console.log("urlObject", urlObject)
     const stateHash = urlObject.searchParams.get("_stateHash");
     if (stateHash === null) {
       console.error("State hash is missing");
@@ -663,11 +664,13 @@ export class R2Registry implements Registry {
       };
     }
     if (hashedState === null || !hashedState.state) {
+      console.log("hashedState", hashedState)
       return { response: new InternalError() };
     }
     const state = hashedState.state;
 
     const uuid = state.registryUploadId;
+    console.log("state", state.parts.length, expectedSha)
     if (state.parts.length === 0) {
       if (!stream) {
         console.error("There has been an upload with zero parts and the body is null");
@@ -688,17 +691,24 @@ export class R2Registry implements Registry {
       });
     } else {
       const upload = this.env.REGISTRY.resumeMultipartUpload(uuid, state.uploadId);
+      console.log("resumeMultipartUpload complete", upload)
       // TODO: Handle one last buffer here
       await upload.complete(state.parts);
+      console.log("upload complete")
       const obj = await this.env.REGISTRY.get(uuid);
+      console.log("obj", JSON.stringify(obj))
+      console.log(expectedSha, "expectedSha", (expectedSha as string).slice(SHA256_PREFIX_LEN))
       const put = this.env.REGISTRY.put(`${namespace}/blobs/${expectedSha}`, obj!.body, {
         sha256: (expectedSha as string).slice(SHA256_PREFIX_LEN),
       });
 
       await put;
+      console.log("put complete", put)
       await this.env.REGISTRY.delete(uuid);
+      console.log("before first delete")
     }
 
+    console.log("before second delete")
     await this.env.REGISTRY.delete(getRegistryUploadsPath(state));
 
     return {
