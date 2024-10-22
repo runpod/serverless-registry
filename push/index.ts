@@ -219,6 +219,17 @@ import { ReadableLimiter } from "./limiter";
 
 const cred = `Basic ${btoa(`${username}:${password}`)}`;
 
+function parseLocation(location: string) {
+  if (location.startsWith("/")) {
+
+    return `${proto}://${imageHost}${location}`;
+
+  }
+
+  return location;
+
+}
+
 console.log("Starting push to remote");
 // pushLayer accepts the target digest, the stream to read from, and the total layer size.
 // It will do the entire push process by itself.
@@ -260,6 +271,7 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
   if (isNaN(maxChunkLength)) {
     throw new Error(`oci-chunk-max-length header is malformed (not a number)`);
   }
+  console.log(maxChunkLength, "maxChunkLength")
 
   const reader = readableStream.getReader();
   const uploadId = createUploadResponse.headers.get("docker-upload-uuid");
@@ -268,7 +280,7 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
   }
 
   let location = createUploadResponse.headers.get("location") ?? `/v2${imageRepositoryPath}/blobs/uploads/${uploadId}`;
-  const putChunkUploadURL = `${proto}://${imageHost}${location}`;
+  const patchChunkUploadURL = `${proto}://${imageHost}${location}`;
   const maxToWrite = Math.min(maxChunkLength, totalLayerSize);
   let end = Math.min(maxChunkLength, totalLayerSize);
   let written = 0;
@@ -278,22 +290,11 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
     const range = `0-${Math.min(end, totalLayerSize) - 1}`;
     const current = new ReadableLimiter(reader as ReadableStreamDefaultReader, maxToWrite, previousReadable);
 
-    // TODO: remove this later
-    // if (totalLayerSizeLeft > 100000000 * 5) {
-    //   console.log("maxChunkLength < totalLayerSizeLeft. skipping", maxChunkLength, totalLayerSizeLeft)
-    //   previousReadable = current;
-    //   totalLayerSizeLeft -= 100000000;
-    //   written += 100000000;
-    //   end += 100000000;
-    //   if (totalLayerSizeLeft != 0) console.log(layerDigest + ":", totalLayerSizeLeft, "upload bytes left.");
-    //   continue;
-    // }
-
     console.log("PATCH")
     // we have to do fetchNode because Bun doesn't allow setting custom Content-Length.
     // https://github.com/oven-sh/bun/issues/10507
 
-    const putChunkResult = await fetchNode(putChunkUploadURL, {
+    const patchChunkResult = await fetchNode(patchChunkUploadURL, {
       method: "PATCH",
       body: current,
       headers: new Headers({
@@ -302,16 +303,16 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
         "content-length": `${Math.min(totalLayerSizeLeft, maxToWrite)}`,
       }),
     });
-    if (!putChunkResult.ok) {
-      console.log(await putChunkResult.text());
+    if (!patchChunkResult.ok) {
+      console.log(await patchChunkResult.text());
       throw new Error(
-        `uploading chunk ${putChunkUploadURL} returned ${putChunkResult.status}`,
+        `uploading chunk ${patchChunkUploadURL} returned ${patchChunkResult.status}`,
       );
     }
 
-    const rangeResponse = putChunkResult.headers.get("range");
+    const rangeResponse = patchChunkResult.headers.get("range");
     if (rangeResponse !== range) {
-      console.log(await putChunkResult.text());
+      console.log(await patchChunkResult.text());
       throw new Error(`unexpected Range header ${rangeResponse}, expected ${range}`);
     }
 
@@ -319,12 +320,12 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
     totalLayerSizeLeft -= previousReadable.written;
     written += previousReadable.written;
     end += previousReadable.written;
-    location = putChunkResult.headers.get("location") ?? location;
+    location = patchChunkResult.headers.get("location") ?? location;
     if (totalLayerSizeLeft != 0) console.log(layerDigest + ":", totalLayerSizeLeft, "upload bytes left.");
   }
 
   const range = `0-${written - 1}`;
-  const uploadURL = new URL(`${proto}://${imageHost}${location}`);
+  const uploadURL = new URL(parseLocation(location));
   uploadURL.searchParams.append("digest", layerDigest);
   console.log("PUT")
   const response = await fetch(uploadURL.toString(), {

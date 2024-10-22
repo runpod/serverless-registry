@@ -698,6 +698,7 @@ export class R2Registry implements Registry {
       const obj = await this.env.REGISTRY.get(uuid);
       console.log("obj", JSON.stringify(obj))
       console.log(expectedSha, "expectedSha", (expectedSha as string).slice(SHA256_PREFIX_LEN), `${namespace}/blobs/${expectedSha}`)
+      console.log("obj!.body", obj!.body)
       const put = this.env.REGISTRY.put(`${namespace}/blobs/${expectedSha}`, obj!.body, {
         sha256: (expectedSha as string).slice(SHA256_PREFIX_LEN),
       });
