@@ -6,8 +6,6 @@ import stream from "node:stream";
 export class ReadableLimiter extends stream.Readable {
   public written: number = 0;
   private leftover: Uint8Array | undefined;
-  private promise: Promise<Uint8Array> | undefined;
-  private accumulator: Uint8Array[];
 
   constructor(
     // reader will be used to read bytes until limit.
@@ -19,27 +17,7 @@ export class ReadableLimiter extends stream.Readable {
   ) {
     super();
 
-    if (previousReader) {
-      this.leftover = previousReader.leftover;
-      if (previousReader.accumulator.length > 0) {
-        this.promise = new Blob(previousReader.accumulator).bytes();
-        previousReader.accumulator = [];
-      }
-    }
-
-    this.accumulator = [];
-  }
-
-  async init() {
-    if (this.promise !== undefined) {
-      if (this.leftover !== undefined && this.leftover.length > 0)
-        this.leftover = await new Blob([await this.promise, this.leftover ?? []]).bytes();
-      else this.leftover = await this.promise;
-    }
-  }
-
-  ok() {
-    this.accumulator = [];
+    if (previousReader) this.leftover = previousReader.leftover;
   }
 
   _read(): void {
@@ -49,7 +27,6 @@ export class ReadableLimiter extends stream.Readable {
 
     if (this.leftover !== undefined) {
       const toPushNow = this.leftover.slice(0, this.limit);
-      this.accumulator.push(toPushNow);
       this.leftover = this.leftover.slice(this.limit);
       this.push(toPushNow);
       this.limit -= toPushNow.length;
@@ -73,7 +50,7 @@ export class ReadableLimiter extends stream.Readable {
       }
 
       if (arr.length === 0) return this.push(null);
-      this.accumulator.push(arr);
+
       this.push(arr);
       this.limit -= arr.length;
       this.written += arr.length;
