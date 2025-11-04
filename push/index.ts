@@ -1,20 +1,60 @@
-import { $, CryptoHasher, file, write } from "bun";
+import { $, file } from "bun";
 import { extract } from "tar";
 
-import stream from "node:stream";
 import { mkdir } from "node:fs/promises";
+import http from "node:http";
+import https from "node:https";
+import path from "path";
+import plimit from "p-limit";
+import fetchNode from "node-fetch";
+import { ReadableLimiter } from "./limiter";
+
+// push client for the cloudflare-backed oci registry
+// - reads an extracted docker save (index.json + blobs)
+// - uploads layers in parallel; each layer is sent in chunks using PATCH with content-range
+// - uses keep-alive agents to avoid reconnect overhead between chunks
+
+type IndexJSONFile = {
+  manifests: {
+    digest: string;
+  }[];
+};
+
+type DockerSaveConfigManifest = {
+  config: {
+    digest: string;
+    size: number;
+  };
+  layers: {
+    digest: string;
+  }[];
+};
 
 const username = process.env["USERNAME_REGISTRY"];
-async function read(stream: stream.Readable): Promise<string> {
-  const chunks = [];
-  for await (const chunk of stream.iterator()) {
-    chunks.push(chunk);
-  }
+const password = process.env["REGISTRY_JWT_TOKEN"];
+const tarFile = "output.tar";
+const imagePath = ".output-image";
+const MAX_PARALLEL_LAYERS = +(process.env["MAX_PARALLEL_LAYERS"] ?? 6);
+const pool = plimit(isNaN(MAX_PARALLEL_LAYERS) ? 6 : MAX_PARALLEL_LAYERS);
+const proto = process.env["INSECURE_HTTP_PUSH"] === "true" ? "http" : "https";
 
-  return Buffer.concat(chunks).toString("utf8");
+function log(...args: any[]) {
+  const ts = new Date().toISOString();
+  console.log(ts, "-", ...args);
 }
 
-let password = process.env["REGISTRY_JWT_TOKEN"]
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+function formatMBps(bytes: number, ms: number): string {
+  if (ms <= 0) return "inf";
+  const mb = bytes / (1024 * 1024);
+  return `${(mb / (ms / 1000)).toFixed(2)} MB/s`;
+}
 
 if (!username || !password) {
   console.error("Username or password not defined, push won't be able to authenticate with registry");
@@ -29,236 +69,144 @@ if (image === undefined) {
   process.exit(1);
 }
 
-const installBun = await $`bun install`.quiet();
-if (installBun.exitCode !== 0) {
-  console.error(
-    "Could not install bun",
-  );
-  process.exit(1);
-}
+if (await file(tarFile).exists()) {
+  await mkdir(imagePath, { recursive: true });
 
-
-console.log("Preparing image...");
-// const imageMetadataRes = await $`/usr/bin/docker images --format "{{ .ID }}" ${image}`;
-// if (imageMetadataRes.exitCode !== 0) {
-//   console.error(
-//     "Image",
-//     image,
-//     "doesn't exist. The docker daemon might not be running, or the image doesn't exist. Check your existing images with\n\n\tdocker images",
-//   );
-//   process.exit(1);
-// }
-
-// const imageID = imageMetadataRes.text();
-// if (imageID === "") {
-//   console.error("Image", image, "doesn't exist. Check your existing images with\n\n\tdocker images");
-//   process.exit(1);
-// }
-
-console.log(`Image ${image} found locally, saving to disk...`);
-
-const tarFile = "output.tar";
-const imagePath = ".output-image";
-if ((await file(tarFile).exists())) {
-  // const output = await $`/usr/bin/docker save ${image} --output ${tarFile}`;
-
-  // if (output.exitCode != 0) {
-  //   console.error("Error saving image", image, output.text());
-  //   process.exit(1);
-  // }
-
-  console.log(`Image saved as ${tarFile}, extracting...`);
-
-  await mkdir(imagePath);
-
-  const result = await extract({
+  await extract({
     file: tarFile,
     cwd: imagePath,
   });
-
-  console.log(`Extracted to ${imagePath}`);
-} 
-
-type IndexJSONFile = {
-  manifests: {
-    digest: string,
-  }[]
+} else {
+  const idxExists = await file(path.join(imagePath, "index.json")).exists();
+  if (!idxExists) {
+    console.error(`Neither ${tarFile} found nor ${imagePath}/index.json present. Aborting.`);
+    process.exit(1);
+  }
 }
 
 const indexJSONFile = (await Bun.file(path.join(imagePath, "index.json")).json()) as IndexJSONFile;
-// if (indexJSONFile.manifests.length > 0) {
-//   throw new Error('More than one manifest file found')
-// }
+const manifestFile = indexJSONFile.manifests[0].digest.replace("sha256:", "");
 
-
-console.log(indexJSONFile)
-let manifestFile = indexJSONFile.manifests[0].digest
-manifestFile = manifestFile.replace("sha256:", "")
-console.log(manifestFile, "manifest file found");
-
-const manifestBlobFile = file(`${imagePath}/blobs/sha256/${manifestFile}`)
+const manifestBlobFile = file(`${imagePath}/blobs/sha256/${manifestFile}`);
 await Bun.write(`${imagePath}/manifest.json`, manifestBlobFile);
 
-// const moveManifestFileRes = await $`cp ${imagePath}/blobs/sha256/${manifestFile} ${imagePath}/manifest.json`
-// if (moveManifestFileRes.exitCode !== 0) {
-//   throw new Error('Could not move manifest file to manifest.json')
-// }
+let manifestAny = (await Bun.file(path.join(imagePath, "manifest.json")).json()) as any;
+// handle manifest lists by resolving to a single-platform manifest
+if (manifestAny && Array.isArray(manifestAny.manifests)) {
+  // pick first entry; optionally prefer linux/amd64 if present
+  const preferOs = (process.env["PUSH_OS"] ?? "linux").toString();
+  const preferArch = (process.env["PUSH_ARCH"] ?? "amd64").toString();
+  const preferred = manifestAny.manifests.find(
+    (m: any) => m.platform?.os === preferOs && m.platform?.architecture === preferArch,
+  );
+  const candidates: any[] = preferred
+    ? [preferred, ...manifestAny.manifests.filter((m: any) => m !== preferred)]
+    : [...manifestAny.manifests];
+  let picked: any | undefined;
+  let pickedPath: string | undefined;
+  for (const cand of candidates) {
+    if (!cand?.digest) continue;
+    const d = (cand.digest as string).replace("sha256:", "");
+    const p = path.join(imagePath, "blobs/sha256/", d);
+    if (await file(p).exists()) {
+      picked = cand;
+      pickedPath = p;
+      break;
+    }
+  }
+  if (!picked || !pickedPath) {
+    const available = (manifestAny.manifests || []).map((m: any) => m?.digest).filter(Boolean);
+    throw new Error(
+      `manifest list entries not found under blobs. available digests: ${available.join(
+        ", ",
+      )}. re-export single-arch (docker pull --platform=${preferOs}/${preferArch} <image>; docker save <image> --output output.tar)) or ensure the selected platform blobs are present.`,
+    );
+  }
+  manifestAny = await Bun.file(pickedPath).json();
+  // write out the resolved manifest for visibility/debugging
+  await Bun.write(path.join(imagePath, "manifest.json"), JSON.stringify(manifestAny));
+  log("resolved manifest list entry", { os: picked.platform?.os, arch: picked.platform?.architecture });
+}
 
-type DockerSaveConfigManifest = {
-  config: {
-    digest: string;
-    size: number;
-  };
-  layers: {
-    digest: string;
-  }[];
-};
+const manifest = manifestAny as DockerSaveConfigManifest;
+if (!manifest || !Array.isArray((manifest as any).layers)) {
+  throw new Error("manifest does not contain layers; ensure image was saved correctly or select a platform");
+}
 
-import path from "path";
-const manifest = (await Bun.file(path.join(imagePath, "manifest.json")).json()) as DockerSaveConfigManifest;
+await mkdir(imagePath, { recursive: true });
+const tasks = [] as Promise<string>[];
 
-// if (manifests.length == 0) {
-//   console.error("unexpected manifest of length 0");
-//   process.exit(1);
-// }
-
-// if (manifests.length > 1) {
-//   console.warn("Manifest resolved to multiple images, picking the first one");
-// }
-
-console.log(manifest, "manifest")
-
-import plimit from "p-limit";
-const pool = plimit(5);
-import zlib from "node:zlib";
-import { rename, rm } from "node:fs/promises";
-
-const cacheFolder = imagePath;
-
-await mkdir(cacheFolder, { recursive: true });
-
-// const [manifest] = manifests;
-const tasks = [];
-
-console.log(manifest.layers)
-console.log("Compressing...");
-// Iterate through every layer, read it and compress to a file
+// iterate through every layer, read it and compress to a file
 for (const layer of manifest.layers) {
   tasks.push(
     pool(async () => {
-
-      return layer.digest.replace("sha256:", "")
-      // let layerPath = path.join(imagePath, layer);
-      // // docker likes to put stuff in two ways:
-      // //   1. blobs/sha256/<layer>
-      // //   2. <layer>/layer.tar
-      // //
-      // // This handles both cases.
-      // let layerName = layer.endsWith(".tar") ? path.dirname(layer) : path.basename(layer);
-
-      // const layerCachePath = path.join(cacheFolder, layerName + "-ptr");
-      // {
-      //   const layerCacheGzip = file(layerCachePath);
-      //   if (await layerCacheGzip.exists()) {
-      //     const compressedDigest = await layerCacheGzip.text();
-      //     return compressedDigest;
-      //   }
-      // }
-
-      // const inprogressPath = path.join(cacheFolder, layerName + "-in-progress");
-      // await rm(inprogressPath, { recursive: true });
-
-      // const hasher = new Bun.CryptoHasher("sha256");
-      // const cacheWriter = file(inprogressPath).writer();
-      // const gzipStream = zlib.createGzip({ level: 9 });
-      // const writeStream = new stream.Writable({
-      //   write(val: Buffer, _, cb) {
-      //     hasher.update(val, "binary");
-      //     cacheWriter.write(val);
-      //     cb();
-      //   },
-      // });
-
-      // gzipStream.pipe(writeStream);
-      // await file(layerPath)
-      //   .stream()
-      //   .pipeTo(
-      //     new WritableStream({
-      //       write(value: Buffer) {
-      //         return new Promise(async (res) => {
-      //           const needsWriteBackoff = gzipStream.write(value);
-      //           // We need to back-off with the writes
-      //           if (!needsWriteBackoff) {
-      //             const onDrain = () => {
-      //               // Remove event listener when it finishes
-      //               gzipStream.off("drain", onDrain);
-      //               res();
-      //             };
-
-      //             gzipStream.on("drain", onDrain);
-      //             return;
-      //           }
-
-      //           res();
-      //         });
-      //       },
-      //       close() {
-      //         return new Promise(async (res) => {
-      //           // Flush before end
-      //           await new Promise((resFlush) => gzipStream.flush(() => resFlush(true)));
-      //           // End the stream
-      //           gzipStream.end(res);
-      //         });
-      //       },
-      //     }),
-      //   );
-
-      // // Wait until the gzipStream has finished all the piping
-      // await new Promise((res) => gzipStream.on("end", () => res(true)));
-
-      // const digest = hasher.digest("hex");
-      // await rename(inprogressPath, path.join(cacheFolder, digest));
-      // await write(layerCachePath, digest);
-      // return digest;
+      return layer.digest.replace("sha256:", "");
     }),
   );
 }
 
-// const configManifest = manifest.Config
-const config = manifest.config
-const configDigest = config.digest.replace("sha256:", "")
+const config = manifest.config;
+const configDigest = config.digest.replace("sha256:", "");
 
 const compressedDigests = await Promise.all(tasks);
 
-const proto = process.env["INSECURE_HTTP_PUSH"] === "true" ? "http" : "https";
-if (proto === "http") {
+// precompute layer sizes
+const plannedLayers = compressedDigests.map((d) => ({
+  digest: d,
+  size: file(`${imagePath}/blobs/sha256/${d}`).size,
+}));
+
+const plannedConfigSize = file(`${imagePath}/blobs/sha256/${configDigest}`).size;
+const plannedTotalBytes = plannedLayers.reduce((acc, l) => acc + l.size, 0) + plannedConfigSize;
+
+log("upload plan", {
+  layers: plannedLayers.length + 1,
+  totalBytes: formatBytes(plannedTotalBytes),
+  avgLayerSizeMB: (plannedLayers.reduce((a, b) => a + b.size, 0) / plannedLayers.length / (1024 * 1024)).toFixed(2),
+  parallel: MAX_PARALLEL_LAYERS,
+});
+
+// parse target: accept full URL (http/https) or host/path:tag
+const parsedTargetUrl = /^(https?:)\/\//i.test(image) ? new URL(image) : new URL(`${proto}://${image}`);
+const scheme = parsedTargetUrl.protocol.replace(":", "");
+if (scheme === "http") {
   console.error("!! Using plain HTTP !!");
 }
 
 const pushTasks = [];
-const url = new URL(proto + "://" + image);
-const imageHost = url.host;
-const imageRepositoryPathParts = url.pathname.split(":");
+const overallStart = Date.now();
+const imageHost = parsedTargetUrl.host;
+const imageRepositoryPathParts = parsedTargetUrl.pathname.split(":");
 const imageRepositoryPath = imageRepositoryPathParts.slice(0, imageRepositoryPathParts.length - 1).join(":");
 const tag =
   imageRepositoryPathParts.length > 1 ? imageRepositoryPathParts[imageRepositoryPathParts.length - 1] : "latest";
 
-import fetchNode from "node-fetch";
-import { ReadableLimiter } from "./limiter";
-
 const cred = `Basic ${btoa(`${username}:${password}`)}`;
 
-console.log("Starting push to remote");
-// pushLayer accepts the target digest, the stream to read from, and the total layer size.
-// It will do the entire push process by itself.
+// log basic configuration before we begin
+const DISABLE_KEEPALIVE = (process.env["DISABLE_KEEPALIVE"] ?? "false").toString() === "true";
+const agent = DISABLE_KEEPALIVE
+  ? undefined
+  : scheme === "http"
+  ? new http.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 64, maxFreeSockets: 32 })
+  : new https.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 64, maxFreeSockets: 32 });
+
+log("starting push", { imageHost, imageRepositoryPath, tag, MAX_PARALLEL_LAYERS, proto: scheme, DISABLE_KEEPALIVE });
+
+// push layer to registry
 async function pushLayer(layerDigest: string, readableStream: ReadableStream, totalLayerSize: number) {
   const headers = new Headers({
     authorization: cred,
   });
-  const layerExistsURL = `${proto}://${imageHost}/v2${imageRepositoryPath}/blobs/${layerDigest}`;
-  const layerExistsResponse = await fetch(layerExistsURL, {
+  if (!agent) headers.set("connection", "close");
+  const layerStart = Date.now();
+
+  const layerExistsURL = `${scheme}://${imageHost}/v2${imageRepositoryPath}/blobs/${layerDigest}`;
+  const layerExistsResponse = await fetchNode(layerExistsURL, {
     headers,
     method: "HEAD",
+    // @ts-ignore node-fetch agent
+    agent,
   });
 
   if (!layerExistsResponse.ok && layerExistsResponse.status !== 404) {
@@ -270,10 +218,13 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
     return;
   }
 
-  const createUploadURL = `${proto}://${imageHost}/v2${imageRepositoryPath}/blobs/uploads/`;
-  const createUploadResponse = await fetch(createUploadURL, {
+  const createUploadURL = `${scheme}://${imageHost}/v2${imageRepositoryPath}/blobs/uploads/`;
+  const tCreateStart = Date.now();
+  const createUploadResponse = await fetchNode(createUploadURL, {
     headers,
     method: "POST",
+    // @ts-ignore node-fetch agent
+    agent,
   });
   if (!createUploadResponse.ok) {
     throw new Error(
@@ -281,10 +232,21 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
     );
   }
 
-  const maxChunkLength = +(createUploadResponse.headers.get("oci-chunk-max-length") ?? 100 * 1024 * 1024);
+  const maxChunkLength = +(
+    createUploadResponse.headers.get("oci-chunk-max-length") ??
+    createUploadResponse.headers.get("OCI-Chunk-Max-Length") ??
+    100 * 1024 * 1024
+  );
+
   if (isNaN(maxChunkLength)) {
     throw new Error(`oci-chunk-max-length header is malformed (not a number)`);
   }
+
+  log("created upload", {
+    uploadId: createUploadResponse.headers.get("docker-upload-uuid"),
+    maxChunkLength,
+    tookMs: Date.now() - tCreateStart,
+  });
 
   const reader = readableStream.getReader();
   const uploadId = createUploadResponse.headers.get("docker-upload-uuid");
@@ -294,7 +256,7 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
 
   function parseLocation(location: string) {
     if (location.startsWith("/")) {
-      return `${proto}://${imageHost}${location}`;
+      return `${scheme}://${imageHost}${location}`;
     }
 
     return location;
@@ -302,59 +264,116 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
 
   let location = createUploadResponse.headers.get("location") ?? `/v2${imageRepositoryPath}/blobs/uploads/${uploadId}`;
   const maxToWrite = Math.min(maxChunkLength, totalLayerSize);
-  let end = Math.min(maxChunkLength, totalLayerSize);
+
   let written = 0;
   let previousReadable: ReadableLimiter | undefined;
   let totalLayerSizeLeft = totalLayerSize;
+  let chunkIndex = 0;
+  let lastPatchEnd = Date.now();
+
   while (totalLayerSizeLeft > 0) {
-    const range = `0-${Math.min(end, totalLayerSize) - 1}`;
-    const current = new ReadableLimiter(reader as ReadableStreamDefaultReader, maxToWrite, previousReadable);
+    const toWriteNow = Math.min(maxToWrite, totalLayerSizeLeft);
+    const startOffset = written;
+    const endOffsetInclusive = startOffset + toWriteNow - 1;
+    const contentRange = `${startOffset}-${endOffsetInclusive}`;
+    const expectedResponseRange = `0-${endOffsetInclusive}`;
+    const current = new ReadableLimiter(reader as ReadableStreamDefaultReader, toWriteNow, previousReadable);
     const patchChunkUploadURL = parseLocation(location);
+
     // we have to do fetchNode because Bun doesn't allow setting custom Content-Length.
     // https://github.com/oven-sh/bun/issues/10507
+    const tPatchStart = Date.now();
+    const idleMs = tPatchStart - lastPatchEnd;
+
+    log("patch start", {
+      layer: layerDigest,
+      chunkIndex,
+      contentRange,
+      toWriteNow,
+      location: patchChunkUploadURL,
+      idleMsBeforePatch: idleMs,
+    });
+
     const patchChunkResult = await fetchNode(patchChunkUploadURL, {
       method: "PATCH",
       body: current,
       headers: new Headers({
-        "range": range,
+        "content-range": contentRange,
+        // keep sending Range for compatibility with some proxies; server reads Content-Range
+        "range": expectedResponseRange,
         "authorization": cred,
-        "content-length": `${Math.min(totalLayerSizeLeft, maxToWrite)}`,
+        "content-length": `${toWriteNow}`,
       }),
+      // @ts-ignore node-fetch agent
+      agent,
     });
+    if (!agent) patchChunkResult as any; // keep tree-shaking from removing usage
+
     if (!patchChunkResult.ok) {
+      const body = await patchChunkResult.text();
       throw new Error(
-        `uploading chunk ${patchChunkUploadURL} returned ${patchChunkResult.status}: ${await patchChunkResult.text()}`,
+        `patch failed layer=${layerDigest} chunkIndex=${chunkIndex} contentRange=${contentRange} url=${patchChunkUploadURL} status=${patchChunkResult.status} body=${body}`,
       );
     }
 
     const rangeResponse = patchChunkResult.headers.get("range");
-    if (rangeResponse !== range) {
-      throw new Error(`unexpected Range header ${rangeResponse}, expected ${range}`);
+    if (rangeResponse !== expectedResponseRange) {
+      throw new Error(
+        `unexpected range header: got=${rangeResponse} expected=${expectedResponseRange} layer=${layerDigest} chunkIndex=${chunkIndex}`,
+      );
     }
 
     previousReadable = current;
     totalLayerSizeLeft -= previousReadable.written;
     written += previousReadable.written;
-    end += previousReadable.written;
     location = patchChunkResult.headers.get("location") ?? location;
-    if (totalLayerSizeLeft != 0) console.log(layerDigest + ":", totalLayerSizeLeft, "upload bytes left.");
+
+    const dt = Date.now() - tPatchStart;
+    const mb = previousReadable.written / (1024 * 1024);
+    const mbps = dt > 0 ? (mb / (dt / 1000)).toFixed(2) : "inf";
+
+    log("patch done", {
+      layer: layerDigest,
+      chunkIndex,
+      wroteBytes: previousReadable.written,
+      tookMs: dt,
+      speedMBps: mbps,
+      nextLocation: location,
+      remainingBytes: totalLayerSizeLeft,
+    });
+
+    chunkIndex++;
+    lastPatchEnd = Date.now();
+    if (totalLayerSizeLeft != 0) log(layerDigest + ":", totalLayerSizeLeft, "upload bytes left.");
   }
 
-  const range = `0-${written - 1}`;
   const uploadURL = new URL(parseLocation(location));
   uploadURL.searchParams.append("digest", layerDigest);
-  const response = await fetch(uploadURL.toString(), {
+
+  const tPutStart = Date.now();
+  const response = await fetchNode(uploadURL.toString(), {
     method: "PUT",
     headers: new Headers({
-      Range: range,
       Authorization: cred,
+      ...(agent ? {} : { connection: "close" }),
     }),
+    // @ts-ignore node-fetch agent
+    agent,
   });
+
   if (!response.ok) {
     throw new Error(`${uploadURL.toString()} failed with ${response.status}: ${await response.text()}`);
   }
 
-  console.log("Pushed", layerDigest);
+  const layerMs = Date.now() - layerStart;
+  log("layer complete", {
+    layer: layerDigest,
+    chunks: chunkIndex,
+    totalBytes: written,
+    tookMs: Date.now() - tPutStart,
+    layerMs,
+    avgSpeed: formatMBps(written, layerMs),
+  });
 }
 
 const layersManifest = [] as {
@@ -365,11 +384,13 @@ const layersManifest = [] as {
 
 for (const compressedDigest of compressedDigests) {
   let layer = file(`${imagePath}/blobs/sha256/${compressedDigest}`);
+
   layersManifest.push({
     mediaType: "application/vnd.oci.image.layer.v1.tar+gzip",
     size: layer.size,
     digest: `sha256:${compressedDigest}`,
   } as const);
+
   pushTasks.push(
     pool(async () => {
       const maxRetries = +(process.env["MAX_RETRIES"] ?? 8);
@@ -379,6 +400,7 @@ for (const compressedDigest of compressedDigests) {
         const digest = `sha256:${compressedDigest}`;
         const stream = layer.stream();
         try {
+          log("Upload layer start", { layer: digest, size: layer.size });
           await pushLayer(digest, stream, layer.size);
           return;
         } catch (err) {
@@ -410,22 +432,6 @@ pushTasks.push(
   }),
 );
 
-
-// pushTasks.push(
-//   pool(async () => {
-//     await pushLayer(
-//       `sha256:${configDigest}`,
-//       new ReadableStream({
-//         pull(controller) {
-//           controller.enqueue(config);
-//           controller.close();
-//         },
-//       }),
-//       config.size,
-//     );
-//   }),
-// );
-
 const promises = await Promise.allSettled(pushTasks);
 for (const promise of promises) {
   if (promise.status === "rejected") {
@@ -444,14 +450,17 @@ const manifestObject = {
   layers: layersManifest,
 } as const;
 
-const manifestUploadURL = `${proto}://${imageHost}/v2${imageRepositoryPath}/manifests/${tag}`;
-const responseManifestUpload = await fetch(manifestUploadURL, {
+const manifestUploadURL = `${scheme}://${imageHost}/v2${imageRepositoryPath}/manifests/${tag}`;
+const responseManifestUpload = await fetchNode(manifestUploadURL, {
   headers: {
     "authorization": cred,
     "content-type": manifestObject.mediaType,
+    ...(agent ? ({} as any) : ({ connection: "close" } as any)),
   },
   body: JSON.stringify(manifestObject),
   method: "PUT",
+  // @ts-ignore node-fetch agent
+  agent,
 });
 
 if (!responseManifestUpload.ok) {
@@ -461,5 +470,11 @@ if (!responseManifestUpload.ok) {
     }: ${await responseManifestUpload.text()}`,
   );
 }
-console.log(manifestObject);
-console.log("OK");
+
+const overallMs = Date.now() - overallStart;
+
+log("push complete", {
+  tookMs: overallMs,
+  totalBytes: formatBytes(plannedTotalBytes),
+  avgSpeed: formatMBps(plannedTotalBytes, overallMs),
+});

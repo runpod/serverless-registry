@@ -1,57 +1,60 @@
-# Push chunked images to serverless-registry
+## push chunked images to serverless-registry
 
-This is a pretty simple tool that allows you to push docker images to serverless-registry
-when the layers are too big.
+this tool pushes docker/oci images to the serverless-registry using chunked uploads. it respects the registry’s
+advertised `oci-chunk-max-length` and sends each layer in sequential chunks over a keep-alive connection.
 
-## How to run
+## requirements
+
+- bun
+- the image exported via `docker save` as `output.tar` in this directory, or an already-extracted image tree in
+  `.output-image/` containing `index.json` and `blobs/`
+
+## quick start
 
 ```bash
 bun install
+
+# option a: start from a docker save tarball in this folder
+docker save <image> --output output.tar
+
+# option b: use a pre-extracted tree at .output-image/
+#   ensure .output-image/index.json exists and blobs are under .output-image/blobs/sha256/
+
+# run the pusher
+USERNAME_REGISTRY=<username> REGISTRY_JWT_TOKEN=<token> bun run index.ts <registry-host>/<repo>:<tag>
 ```
 
-Then:
+## environment variables
+
+- `USERNAME_REGISTRY` (required): basic auth username
+- `REGISTRY_JWT_TOKEN` (required): basic auth password/token
+- `SKIP_AUTH` (optional): set to any value to bypass the username/password check (useful for local testing)
+- `INSECURE_HTTP_PUSH` (optional): set to `true` to use http instead of https (for local registries)
+- `MAX_PARALLEL_LAYERS` (optional): number of layers to upload concurrently (default 6)
+- `MAX_RETRIES` (optional): per-layer retry count on transient failures (default 8)
+
+## how it works
+
+- reads `output.tar` and extracts to `.output-image/`, or uses an existing `.output-image/`
+- parses `.output-image/index.json` and resolves the manifest and layer digests
+- uploads layers in parallel using a per-layer loop that:
+  - creates an upload with `POST /v2/<repo>/blobs/uploads/`
+  - streams fixed-size chunks with `PATCH` using `content-range: <start>-<end>` and an explicit `content-length`
+  - completes the layer with a final `PUT` on `.../uploads/<uuid>?digest=<sha256:...>`
+- after all layers and config are present, uploads the manifest with `PUT /v2/<repo>/manifests/<tag>`
+
+## performance notes
+
+- keep-alive is enabled for all requests to avoid connection setup between chunks
+- the pusher respects `oci-chunk-max-length` advertised by the registry, you can’t force larger chunks than the server
+  allows
+- can tweak `MAX_PARALLEL_LAYERS` depending on uplink throughput
+
+## pushing locally
+
+set `INSECURE_HTTP_PUSH=true` to use http:
 
 ```bash
-docker tag my-image:latest $IMAGE_URI
-echo $PASSWORD | USERNAME_REGISTRY=<your-configured-username> bun run index.ts $IMAGE_URI
+INSECURE_HTTP_PUSH=true USERNAME_REGISTRY=<username> REGISTRY_JWT_TOKEN=<token> \
+  bun run index.ts localhost:8787/my/repo:latest
 ```
-
-## How does it work
-
-It exports the image using `docker save`, then pushes each layer to the registry.
-It only supports `Basic` authentication as it's the one that serverless-registry uses.
-
-It's able to chunk layers depending on the header `oci-chunk-max-length` returned by the registry when the client
-creates an upload.
-
-## Interesting output folders
-
-- Every \*.tar in the push folder is the exported image from docker, which is extracted into `.cache`.
-- Then it's compressed to gzip and saved into `.cache`. Files that end in `-ptr` have a digest in the content that
-  refers to another layer in the folder.
-
-There is a few more workarounds in the code like having to use node-fetch as Bun overrides the Content-Length
-header from the caller.
-
-This pushing tool is just a workaround on the Worker limitation in request body.
-
-## Pushing locally
-
-To push to a localhost registry you need to set the environment variable INSECURE_HTTP_PUSH=true.
-
-## Other options?
-
-If the reader is interested, there is more options or alternatives to have a faster pushing chunk tool:
-
-1. We could redesign this tool to run with the Docker overlay storage. The biggest con is having to run a
-   privileged docker container that uses https://github.com/justincormack/nsenter1 to access the Docker storage.
-
-2. Create a localhost proxy that understands V2 registry protocol, and chunks things accordingly. The con is that
-   docker has issues pushing to localhost registries.
-
-3. Use podman like described in this [very informative Github comment](https://github.com/cloudflare/serverless-registry/issues/42#issuecomment-2366997382).
-
-## Improvements
-
-1. Use zstd instead.
-2. Have a better unit test suite.
