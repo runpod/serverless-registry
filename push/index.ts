@@ -176,10 +176,25 @@ if (scheme === "http") {
 const pushTasks = [];
 const overallStart = Date.now();
 const imageHost = parsedTargetUrl.host;
-const imageRepositoryPathParts = parsedTargetUrl.pathname.split(":");
-const imageRepositoryPath = imageRepositoryPathParts.slice(0, imageRepositoryPathParts.length - 1).join(":");
-const tag =
-  imageRepositoryPathParts.length > 1 ? imageRepositoryPathParts[imageRepositoryPathParts.length - 1] : "latest";
+
+let imageRepositoryPath = parsedTargetUrl.pathname;
+let tag = "latest";
+
+if (imageRepositoryPath.startsWith("/")) {
+  imageRepositoryPath = imageRepositoryPath.slice(1);
+}
+
+// check if a tag is included after ':' but not as part of a path component
+const lastColon = imageRepositoryPath.lastIndexOf(":");
+const lastSlash = imageRepositoryPath.lastIndexOf("/");
+
+if (lastColon > -1 && lastColon > lastSlash) {
+  // there's a tag present
+  tag = imageRepositoryPath.slice(lastColon + 1);
+  imageRepositoryPath = imageRepositoryPath.slice(0, lastColon);
+}
+
+imageRepositoryPath = "/" + imageRepositoryPath;
 
 const cred = `Basic ${btoa(`${username}:${password}`)}`;
 
