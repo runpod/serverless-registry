@@ -23,7 +23,7 @@
     "miniflare": "3.20240909.4",
     "typescript": "^5.3.3",
     "vitest": "^2.1.0",
-    "wrangler": "^3.78.7"
+    "wrangler": "^4.45.4"
   },
   "engines": {
     "node": ">=18"
