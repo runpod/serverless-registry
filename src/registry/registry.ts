@@ -74,6 +74,13 @@ export type UploadObject = {
   maximumBytesPerChunk?: number;
 };
 
+export type DirectUploadInfo = {
+  upload: UploadObject;
+  uploadUrl: string;
+  expiresIn: number;
+  headers?: Record<string, string>;
+};
+
 // response when you finish an upload
 export type FinishedUploadObject = {
   digest: string;
@@ -130,6 +137,12 @@ export interface Registry {
 
   // starts a new upload
   startUpload(namespace: string): Promise<UploadObject | RegistryError>;
+
+  // starts a new direct upload (pre-signed url)
+  startDirectUpload(
+    namespace: string,
+    opts: { digest: string; size?: number },
+  ): Promise<DirectUploadInfo | RegistryError>;
 
   // cancels an upload
   cancelUpload(namespace: string, uploadId: UploadId): Promise<true | RegistryError>;
