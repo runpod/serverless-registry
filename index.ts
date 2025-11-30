@@ -24,6 +24,11 @@ export interface Env {
   PUSH_COMPATIBILITY_MODE?: PushCompatibilityMode;
   REGISTRIES_JSON?: string; // should be in the format of RegistryConfiguration[];
   REGISTRY_CLIENT: Registry;
+  R2_SIGNING_ACCESS_KEY_ID?: string;
+  R2_SIGNING_SECRET_ACCESS_KEY?: string;
+  R2_PRESIGN_BUCKET_NAME?: string;
+  R2_PRESIGN_ACCOUNT_ID?: string;
+  R2_PRESIGN_ENDPOINT?: string;
 }
 
 const router = Router();

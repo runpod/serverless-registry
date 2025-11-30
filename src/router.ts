@@ -9,6 +9,7 @@ import { MINIMUM_CHUNK, MAXIMUM_CHUNK, MAXIMUM_CHUNK_UPLOAD_SIZE } from "./chunk
 import {
   CheckLayerResponse,
   CheckManifestResponse,
+  DirectUploadInfo,
   FinishedUploadObject,
   GetLayerResponse,
   GetManifestResponse,
@@ -354,6 +355,43 @@ v2Router.post("/:name+/blobs/uploads/", async (req, env: Env) => {
       )}`,
     },
   });
+});
+
+v2Router.post("/:name+/blobs/uploads/direct", async (req, env: Env) => {
+  const { name } = req.params;
+  let payload: { digest?: string; size?: number } = {};
+  try {
+    payload = await req.json();
+  } catch (error) {
+    console.warn("direct upload missing payload", errorString(error));
+    return new Response(JSON.stringify({ message: "invalid payload" }), { status: 400, headers: jsonHeaders() });
+  }
+
+  if (!payload.digest) {
+    return new Response(JSON.stringify({ message: "digest required" }), { status: 400, headers: jsonHeaders() });
+  }
+
+  const [directUpload, err] = await wrap<DirectUploadInfo | RegistryError, Error>(
+    env.REGISTRY_CLIENT.startDirectUpload(name, { digest: payload.digest, size: payload.size }),
+  );
+  if (err) {
+    return new InternalError();
+  }
+
+  if ("response" in directUpload) {
+    return directUpload.response;
+  }
+
+  return new Response(
+    JSON.stringify({
+      upload_id: directUpload.upload.id,
+      location: directUpload.upload.location,
+      upload_url: directUpload.uploadUrl,
+      expires_in: directUpload.expiresIn,
+      headers: directUpload.headers ?? {},
+    }),
+    { headers: jsonHeaders() },
+  );
 });
 
 v2Router.get("/:name+/blobs/uploads/:uuid", async (req, env: Env) => {

@@ -1,4 +1,5 @@
 import { Env } from "../..";
+import { AwsClient } from "aws4fetch";
 import jwt from "@tsndr/cloudflare-worker-jwt";
 import {
   MINIMUM_CHUNK,
@@ -16,6 +17,7 @@ import { BlobUnknownError, ManifestUnknownError } from "../v2-errors";
 import {
   CheckLayerResponse,
   CheckManifestResponse,
+  DirectUploadInfo,
   FinishedUploadObject,
   GetLayerResponse,
   GetManifestResponse,
@@ -65,6 +67,11 @@ export type State = {
   registryUploadId: string;
   byteRange: number;
   name: string;
+  direct?: {
+    tempKey: string;
+    expectedDigest: string;
+    size?: number;
+  };
 };
 
 export function getRegistryUploadsPath(state: { registryUploadId: string; name: string }): string {
@@ -125,6 +132,48 @@ export async function getUploadState(
   }
 
   return { state: stateObject, stateStr: stateStr, hash: stateStrHash };
+}
+
+async function presignDirectUploadWithAwsClient(
+  env: Env,
+  key: string,
+  expirationSeconds: number,
+): Promise<string | null> {
+  const accessKeyId = env.R2_SIGNING_ACCESS_KEY_ID;
+  const secretAccessKey = env.R2_SIGNING_SECRET_ACCESS_KEY;
+  const bucketName = env.R2_PRESIGN_BUCKET_NAME;
+  const accountId = env.R2_PRESIGN_ACCOUNT_ID;
+  if (!accessKeyId || !secretAccessKey || !bucketName || !accountId) {
+    console.warn(
+      "direct upload fallback requested but signing configuration is incomplete (need R2_SIGNING_ACCESS_KEY_ID, R2_SIGNING_SECRET_ACCESS_KEY, R2_PRESIGN_BUCKET_NAME, R2_PRESIGN_ACCOUNT_ID)",
+    );
+    return null;
+  }
+
+  const client = new AwsClient({
+    accessKeyId,
+    secretAccessKey,
+    service: "s3",
+    region: "auto",
+  });
+
+  const baseUrl = env.R2_PRESIGN_ENDPOINT ?? `https://${bucketName}.${accountId}.r2.cloudflarestorage.com`;
+  const url = new URL(baseUrl);
+  url.pathname = `/${key}`;
+  url.searchParams.set("X-Amz-Expires", `${expirationSeconds}`);
+
+  const signed = await client.sign(
+    new Request(url, {
+      method: "PUT",
+    }),
+    {
+      aws: {
+        signQuery: true,
+      },
+    },
+  );
+
+  return signed.url;
 }
 
 export class R2Registry implements Registry {
@@ -438,6 +487,100 @@ export class R2Registry implements Registry {
     };
   }
 
+  async startDirectUpload(
+    namespace: string,
+    opts: { digest: string; size?: number },
+  ): Promise<DirectUploadInfo | RegistryError> {
+    try {
+      if (!opts.digest || !opts.digest.startsWith("sha256:")) {
+        throw new Error("digest must be sha256");
+      }
+      const uploadId = crypto.randomUUID();
+      const tempKey = `${namespace}/uploads/direct/${uploadId}`;
+      const expirationSeconds = 60 * 15;
+
+      const bucket: R2Bucket & {
+        createSignedUrl?: (options: {
+          key: string;
+          expiration: number;
+          method?: string;
+          headers?: Record<string, string>;
+        }) => Promise<{ url: string; expiration?: number | Date; headers?: Record<string, string> }>;
+      } = this.env.REGISTRY as any;
+
+      let uploadUrl: string;
+      let signedHeaders: Record<string, string> | undefined;
+      let expiresIn = expirationSeconds;
+
+      if (bucket && typeof bucket.createSignedUrl === "function") {
+        const signed = await bucket.createSignedUrl({
+          key: tempKey,
+          expiration: expirationSeconds,
+          method: "PUT",
+          headers: {
+            "Content-Type": "application/octet-stream",
+          },
+        });
+
+        if (!signed || !signed.url) {
+          throw new Error("createSignedUrl is not available in this environment");
+        }
+
+        uploadUrl = signed.url;
+        signedHeaders = signed.headers;
+
+        if (typeof signed.expiration === "number") {
+          expiresIn = signed.expiration;
+        } else if (signed.expiration instanceof Date) {
+          expiresIn = Math.max(1, Math.floor((signed.expiration.getTime() - Date.now()) / 1000));
+        }
+      } else {
+        const fallbackUrl = await presignDirectUploadWithAwsClient(this.env, tempKey, expirationSeconds);
+        if (!fallbackUrl) {
+          return {
+            response: new Response(
+              JSON.stringify({ message: "direct uploads require signing credentials in this environment" }),
+              {
+                status: 501,
+                headers: { "Content-Type": "application/json" },
+              },
+            ),
+          };
+        }
+
+        uploadUrl = fallbackUrl;
+      }
+
+      const state: State = {
+        parts: [],
+        chunks: [],
+        uploadId: "",
+        registryUploadId: uploadId,
+        byteRange: 0,
+        name: namespace,
+        direct: {
+          tempKey,
+          expectedDigest: opts.digest,
+          size: opts.size,
+        },
+      };
+      const hashedState = await encodeState(state, this.env);
+
+      return {
+        upload: {
+          id: uploadId,
+          location: `/v2/${namespace}/blobs/uploads/${uploadId}?_stateHash=${hashedState.hash}`,
+          range: [0, 0],
+        },
+        uploadUrl: uploadUrl,
+        headers: signedHeaders,
+        expiresIn,
+      };
+    } catch (err) {
+      return wrapError("startDirectUpload", err);
+    }
+  }
+
   async getUpload(namespace: string, uploadId: string): Promise<UploadObject | RegistryError> {
     const state = await getUploadState(namespace, uploadId, this.env, undefined);
     if (state === null) {
@@ -666,6 +809,28 @@ export class R2Registry implements Registry {
       return { response: new InternalError() };
     }
     const state = hashedState.state;
+
+    if (state.direct) {
+      if (state.direct.expectedDigest !== expectedSha) {
+        return {
+          response: new RangeError(stateHash, state),
+        };
+      }
+      const tempObject = await this.env.REGISTRY.get(state.direct.tempKey);
+      if (tempObject === null || !tempObject.body) {
+        return { response: new InternalError() };
+      }
+      const finalKey = `${namespace}/blobs/${expectedSha}`;
+      await this.env.REGISTRY.put(finalKey, tempObject.body, {
+        sha256: expectedSha.slice(SHA256_PREFIX_LEN),
+      });
+      await this.env.REGISTRY.delete(state.direct.tempKey);
+      await this.env.REGISTRY.delete(getRegistryUploadsPath(state));
+      return {
+        digest: expectedSha,
+        location: `/v2/${namespace}/blobs/${expectedSha}`,
+      };
+    }
 
     const uuid = state.registryUploadId;
     if (state.parts.length === 0) {
