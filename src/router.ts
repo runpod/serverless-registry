@@ -389,6 +389,7 @@ v2Router.post("/:name+/blobs/uploads/direct", async (req, env: Env) => {
       upload_url: directUpload.uploadUrl,
       expires_in: directUpload.expiresIn,
       headers: directUpload.headers ?? {},
+      parts: directUpload.parts ?? [],
     }),
     { headers: jsonHeaders() },
   );
@@ -484,10 +485,12 @@ v2Router.put("/:name+/blobs/uploads/:uuid", async (req, env: Env) => {
       digest! as string,
       req.body ?? undefined,
       +(req.headers.get("Content-Length") ?? "0"),
+      req.headers,
     ),
   );
 
   if (err) {
+    console.error("Error finishing upload:", errorString(err));
     return new InternalError();
   }
 

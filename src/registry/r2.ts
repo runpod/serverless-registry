@@ -12,11 +12,12 @@ import {
 } from "../chunk";
 import { InternalError, ManifestError, RangeError, ServerError } from "../errors";
 import { SHA256_PREFIX_LEN, getSHA256, hexToDigest } from "../user";
-import { readableToBlob, readerToBlob, wrap } from "../utils";
+import { jsonHeaders, readableToBlob, readerToBlob, wrap } from "../utils";
 import { BlobUnknownError, ManifestUnknownError } from "../v2-errors";
 import {
   CheckLayerResponse,
   CheckManifestResponse,
+  DirectUploadPart,
   DirectUploadInfo,
   FinishedUploadObject,
   GetLayerResponse,
@@ -31,6 +32,13 @@ import {
 } from "./registry";
 import { GarbageCollectionMode, GarbageCollector } from "./garbage-collector";
 import { ManifestSchema, manifestSchema } from "../manifest";
+
+const DIRECT_SINGLE_PUT_LIMIT = 5 * 1024 * 1024 * 1024; // 5GiB
+const DIRECT_MIN_PART_SIZE = 5 * 1024 * 1024; // 5MiB
+const DIRECT_DEFAULT_PART_SIZE = 512 * 1024 * 1024; // 512MiB
+const DIRECT_PARTS_HEADER = "x-registry-direct-parts";
+const DIRECT_OBJECT_POLL_ATTEMPTS = 6;
+const DIRECT_OBJECT_INITIAL_DELAY_MS = 200;
 
 export type Chunk =
   | {
@@ -68,9 +76,14 @@ export type State = {
   byteRange: number;
   name: string;
   direct?: {
-    tempKey: string;
+    objectKey: string;
     expectedDigest: string;
     size?: number;
+    multipart?: {
+      uploadId: string;
+      partSize: number;
+      totalParts: number;
+    };
   };
 };
 
@@ -114,6 +127,7 @@ export async function getUploadState(
   env: Env,
   verifyHash: string | undefined,
 ): Promise<{ state: State; stateStr: string; hash: string } | RangeError | null> {
+  console.log("getUploadState", name, uploadId, verifyHash);
   const stateStr = await getJWT(env, { registryUploadId: uploadId, name: name });
   if (stateStr === null) {
     return null;
@@ -134,10 +148,16 @@ export async function getUploadState(
   return { state: stateObject, stateStr: stateStr, hash: stateStrHash };
 }
 
+type PresignOptions = {
+  method?: string;
+  query?: Record<string, string>;
+};
+
 async function presignDirectUploadWithAwsClient(
   env: Env,
   key: string,
   expirationSeconds: number,
+  options?: PresignOptions,
 ): Promise<string | null> {
   const accessKeyId = env.R2_SIGNING_ACCESS_KEY_ID;
   const secretAccessKey = env.R2_SIGNING_SECRET_ACCESS_KEY;
@@ -161,10 +181,13 @@ async function presignDirectUploadWithAwsClient(
   const url = new URL(baseUrl);
   url.pathname = `/${key}`;
   url.searchParams.set("X-Amz-Expires", `${expirationSeconds}`);
+  for (const [k, v] of Object.entries(options?.query ?? {})) {
+    url.searchParams.set(k, v);
+  }
 
   const signed = await client.sign(
     new Request(url, {
-      method: "PUT",
+      method: options?.method ?? "PUT",
     }),
     {
       aws: {
@@ -174,6 +197,88 @@ async function presignDirectUploadWithAwsClient(
   );
 
   return signed.url;
+}
+
+type DirectPartPlan = {
+  partNumber: number;
+  start: number;
+  end: number;
+  size: number;
+};
+
+function planDirectMultipartParts(totalSize: number): DirectPartPlan[] {
+  let targetSize = Math.min(DIRECT_DEFAULT_PART_SIZE, DIRECT_SINGLE_PUT_LIMIT);
+  if (totalSize / targetSize > 10000) {
+    targetSize = Math.ceil(totalSize / 10000);
+  }
+  targetSize = Math.max(targetSize, DIRECT_MIN_PART_SIZE);
+  targetSize = Math.min(targetSize, DIRECT_SINGLE_PUT_LIMIT);
+
+  const parts: DirectPartPlan[] = [];
+  let offset = 0;
+  let partNumber = 1;
+  while (offset < totalSize) {
+    const next = Math.min(offset + targetSize, totalSize);
+    const size = next - offset;
+    parts.push({
+      partNumber,
+      start: offset,
+      end: next - 1,
+      size,
+    });
+    offset = next;
+    partNumber++;
+  }
+
+  return parts;
+}
+
+type DirectCompletedPart = {
+  partNumber: number;
+  etag: string;
+};
+
+function parseDirectPartsHeader(value: string | null): DirectCompletedPart[] | null {
+  if (!value) return null;
+  try {
+    const decoded = JSON.parse(atob(value)) as unknown;
+    if (!Array.isArray(decoded)) {
+      return null;
+    }
+    const parts: DirectCompletedPart[] = [];
+    for (const entry of decoded) {
+      if (
+        typeof entry === "object" &&
+        entry !== null &&
+        typeof entry.partNumber === "number" &&
+        typeof entry.etag === "string"
+      ) {
+        parts.push({
+          partNumber: entry.partNumber,
+          etag: entry.etag,
+        });
+      }
+    }
+    return parts.length ? parts : null;
+  } catch (err) {
+    console.warn("failed to parse direct parts header", err);
+    return null;
+  }
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function waitForObjectHead(env: Env, key: string): Promise<R2Object | null> {
+  let delay = DIRECT_OBJECT_INITIAL_DELAY_MS;
+  for (let attempt = 0; attempt < DIRECT_OBJECT_POLL_ATTEMPTS; attempt++) {
+    const obj = await env.REGISTRY.head(key);
+    if (obj) {
+      return obj;
+    }
+    await sleep(delay);
+    delay = Math.min(delay * 2, DIRECT_OBJECT_INITIAL_DELAY_MS * 16);
+  }
+  return null;
 }
 
 export class R2Registry implements Registry {
@@ -496,9 +601,10 @@ export class R2Registry implements Registry {
         throw new Error("digest must be sha256");
       }
       const uploadId = crypto.randomUUID();
-      const tempKey = `${namespace}/uploads/direct/${uploadId}`;
-      const expirationSeconds = 60 * 15;
+      const objectKey = `${namespace}/blobs/${opts.digest}`;
+      const expirationSeconds = 24 * 60 * 60; // 24 hours
 
+      const requiresMultipart = !!(opts.size && opts.size > DIRECT_SINGLE_PUT_LIMIT);
       const bucket: R2Bucket & {
         createSignedUrl?: (options: {
           key: string;
@@ -508,34 +614,134 @@ export class R2Registry implements Registry {
         }) => Promise<{ url: string; expiration?: number | Date; headers?: Record<string, string> }>;
       } = this.env.REGISTRY as any;
 
-      let uploadUrl: string;
+      const state: State = {
+        parts: [],
+        chunks: [],
+        uploadId: "",
+        registryUploadId: uploadId,
+        byteRange: 0,
+        name: namespace,
+        direct: {
+          objectKey,
+          expectedDigest: opts.digest,
+          size: opts.size,
+        },
+      };
+
+      if (requiresMultipart) {
+        const totalSize = opts.size!;
+        const hasSigningConfig =
+          !!this.env.R2_SIGNING_ACCESS_KEY_ID &&
+          !!this.env.R2_SIGNING_SECRET_ACCESS_KEY &&
+          !!this.env.R2_PRESIGN_BUCKET_NAME &&
+          !!this.env.R2_PRESIGN_ACCOUNT_ID;
+        if (!hasSigningConfig) {
+          return {
+            response: new Response(
+              JSON.stringify({
+                message:
+                  "direct uploads over 5GiB require signing credentials (R2_SIGNING_ACCESS_KEY_ID, R2_SIGNING_SECRET_ACCESS_KEY, R2_PRESIGN_BUCKET_NAME, R2_PRESIGN_ACCOUNT_ID)",
+              }),
+              {
+                status: 501,
+                headers: { "Content-Type": "application/json" },
+              },
+            ),
+          };
+        }
+
+        const multipart = await this.env.REGISTRY.createMultipartUpload(objectKey);
+        state.uploadId = multipart.uploadId;
+        state.direct!.multipart = {
+          uploadId: multipart.uploadId,
+          partSize: DIRECT_DEFAULT_PART_SIZE,
+          totalParts: 0,
+        };
+
+        const partsPlan = planDirectMultipartParts(totalSize);
+        if (partsPlan.length > 10000) {
+          return {
+            response: new Response(
+              JSON.stringify({ message: "layer is too large for multipart (over 10,000 parts)" }),
+              {
+                status: 400,
+                headers: { "Content-Type": "application/json" },
+              },
+            ),
+          };
+        }
+
+        if (partsPlan.length > 0) {
+          state.direct!.multipart.partSize = partsPlan[0].size;
+        }
+
+        const presignedParts: DirectUploadPart[] = [];
+        for (const plan of partsPlan) {
+          const url = await presignDirectUploadWithAwsClient(this.env, objectKey, expirationSeconds, {
+            query: {
+              uploadId: multipart.uploadId,
+              partNumber: plan.partNumber.toString(),
+            },
+          });
+          if (!url) {
+            return {
+              response: new Response(
+                JSON.stringify({
+                  message: "direct uploads require signing credentials in this environment",
+                }),
+                { status: 501, headers: { "Content-Type": "application/json" } },
+              ),
+            };
+          }
+
+          presignedParts.push({
+            partNumber: plan.partNumber,
+            size: plan.size,
+            start: plan.start,
+            end: plan.end,
+            uploadUrl: url,
+          });
+        }
+
+        state.direct!.multipart.totalParts = presignedParts.length;
+
+        const hashedState = await encodeState(state, this.env);
+        return {
+          upload: {
+            id: uploadId,
+            location: `/v2/${namespace}/blobs/uploads/${uploadId}?_stateHash=${hashedState.hash}`,
+            range: [0, 0],
+          },
+          expiresIn: expirationSeconds,
+          parts: presignedParts,
+        };
+      }
+
+      let uploadUrl: string | undefined;
       let signedHeaders: Record<string, string> | undefined;
       let expiresIn = expirationSeconds;
-
       if (bucket && typeof bucket.createSignedUrl === "function") {
         const signed = await bucket.createSignedUrl({
-          key: tempKey,
+          key: objectKey,
           expiration: expirationSeconds,
           method: "PUT",
           headers: {
             "Content-Type": "application/octet-stream",
           },
         });
-
-        if (!signed || !signed.url) {
-          throw new Error("createSignedUrl is not available in this environment");
+        if (signed && signed.url) {
+          uploadUrl = signed.url;
+          signedHeaders = signed.headers;
+          if (typeof signed.expiration === "number") {
+            expiresIn = signed.expiration;
+          } else if (signed.expiration instanceof Date) {
+            expiresIn = Math.max(1, Math.floor((signed.expiration.getTime() - Date.now()) / 1000));
+          }
         }
+      }
 
-        uploadUrl = signed.url;
-        signedHeaders = signed.headers;
-
-        if (typeof signed.expiration === "number") {
-          expiresIn = signed.expiration;
-        } else if (signed.expiration instanceof Date) {
-          expiresIn = Math.max(1, Math.floor((signed.expiration.getTime() - Date.now()) / 1000));
-        }
-      } else {
-        const fallbackUrl = await presignDirectUploadWithAwsClient(this.env, tempKey, expirationSeconds);
+      if (!uploadUrl) {
+        const fallbackUrl = await presignDirectUploadWithAwsClient(this.env, objectKey, expirationSeconds);
         if (!fallbackUrl) {
           return {
             response: new Response(
@@ -547,32 +753,17 @@ export class R2Registry implements Registry {
             ),
           };
         }
-
         uploadUrl = fallbackUrl;
       }
 
-      const state: State = {
-        parts: [],
-        chunks: [],
-        uploadId: "",
-        registryUploadId: uploadId,
-        byteRange: 0,
-        name: namespace,
-        direct: {
-          tempKey,
-          expectedDigest: opts.digest,
-          size: opts.size,
-        },
-      };
       const hashedState = await encodeState(state, this.env);
-
       return {
         upload: {
           id: uploadId,
           location: `/v2/${namespace}/blobs/uploads/${uploadId}?_stateHash=${hashedState.hash}`,
           range: [0, 0],
         },
-        uploadUrl: uploadUrl,
+        uploadUrl,
         headers: signedHeaders,
         expiresIn,
       };
@@ -791,11 +982,11 @@ export class R2Registry implements Registry {
     expectedSha: string,
     stream?: ReadableStream<any> | undefined,
     length?: number | undefined,
+    headers?: Headers,
   ): Promise<RegistryError | FinishedUploadObject> {
     const urlObject = new URL("https://r2-registry.com" + location);
     const stateHash = urlObject.searchParams.get("_stateHash");
     if (stateHash === null) {
-      console.error("State hash is missing");
       return { response: new InternalError() };
     }
 
@@ -816,15 +1007,36 @@ export class R2Registry implements Registry {
           response: new RangeError(stateHash, state),
         };
       }
-      const tempObject = await this.env.REGISTRY.get(state.direct.tempKey);
-      if (tempObject === null || !tempObject.body) {
-        return { response: new InternalError() };
+
+      if (state.direct.multipart) {
+        const partsHeader = parseDirectPartsHeader(headers?.get(DIRECT_PARTS_HEADER) ?? null);
+        if (!partsHeader || partsHeader.length === 0 || partsHeader.length !== state.direct.multipart.totalParts) {
+          return {
+            response: new Response(
+              JSON.stringify({ message: "direct multipart uploads require complete part metadata" }),
+              { status: 400, headers: jsonHeaders() },
+            ),
+          };
+        }
+
+        const upload = this.env.REGISTRY.resumeMultipartUpload(state.direct.objectKey, state.direct.multipart.uploadId);
+        await upload.complete(
+          partsHeader.map((part) => ({
+            partNumber: part.partNumber,
+            etag: part.etag,
+          })),
+        );
       }
-      const finalKey = `${namespace}/blobs/${expectedSha}`;
-      await this.env.REGISTRY.put(finalKey, tempObject.body, {
-        sha256: expectedSha.slice(SHA256_PREFIX_LEN),
-      });
-      await this.env.REGISTRY.delete(state.direct.tempKey);
+
+      const finalHead = await waitForObjectHead(this.env, state.direct.objectKey);
+      if (!finalHead || !finalHead.checksums.sha256) {
+        console.warn("direct finalize: missing checksum metadata, trusting client digest", state.direct.objectKey);
+      } else if (hexToDigest(finalHead.checksums.sha256) !== expectedSha) {
+        return {
+          response: new RangeError(stateHash, state),
+        };
+      }
+
       await this.env.REGISTRY.delete(getRegistryUploadsPath(state));
       return {
         digest: expectedSha,
@@ -882,8 +1094,13 @@ export class R2Registry implements Registry {
     }
     const state = hashedState.state;
 
-    const upload = this.env.REGISTRY.resumeMultipartUpload(state.registryUploadId, state.uploadId);
-    await upload.abort();
+    if (state.direct && state.direct.multipart) {
+      const upload = this.env.REGISTRY.resumeMultipartUpload(state.direct.objectKey, state.direct.multipart.uploadId);
+      await upload.abort();
+    } else if (state.uploadId) {
+      const upload = this.env.REGISTRY.resumeMultipartUpload(state.registryUploadId, state.uploadId);
+      await upload.abort();
+    }
     return true;
   }
 

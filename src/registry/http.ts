@@ -493,6 +493,7 @@ export class RegistryHTTPClient implements Registry {
     _expectedSha: string,
     _stream?: ReadableStream<any> | undefined,
     _length?: number | undefined,
+    _headers?: Headers | undefined,
   ): Promise<RegistryError | FinishedUploadObject> {
     throw new Error("unimplemented");
   }

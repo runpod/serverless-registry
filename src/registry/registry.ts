@@ -74,11 +74,21 @@ export type UploadObject = {
   maximumBytesPerChunk?: number;
 };
 
+export type DirectUploadPart = {
+  partNumber: number;
+  size: number;
+  start: number;
+  end: number;
+  uploadUrl: string;
+  headers?: Record<string, string>;
+};
+
 export type DirectUploadInfo = {
   upload: UploadObject;
-  uploadUrl: string;
+  uploadUrl?: string;
   expiresIn: number;
   headers?: Record<string, string>;
+  parts?: DirectUploadPart[];
 };
 
 // response when you finish an upload
@@ -179,6 +189,7 @@ export interface Registry {
     expectedDigest: string,
     stream?: ReadableStream,
     length?: number,
+    headers?: Headers,
   ): Promise<FinishedUploadObject | RegistryError>;
 
   garbageCollection(namespace: string, mode: GarbageCollectionMode): Promise<boolean>;
