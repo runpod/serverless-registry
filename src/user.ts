@@ -15,6 +15,7 @@ export function hexToDigest(sha256: ArrayBuffer, prefix: string = SHA256_PREFIX 
 function stringToArrayBuffer(s: string): ArrayBuffer {
   const encoder = new TextEncoder();
   const arr = encoder.encode(s);
+  // @ts-ignore
   return arr;
 }
 

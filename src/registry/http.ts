@@ -5,6 +5,7 @@ import { GarbageCollectionMode } from "./garbage-collector";
 import {
   CheckLayerResponse,
   CheckManifestResponse,
+  DirectUploadInfo,
   FinishedUploadObject,
   GetLayerResponse,
   GetManifestResponse,
@@ -462,6 +463,10 @@ export class RegistryHTTPClient implements Registry {
     throw new Error("unimplemented");
   }
 
+  startDirectUpload(_namespace: string): Promise<DirectUploadInfo | RegistryError> {
+    throw new Error("unimplemented");
+  }
+
   cancelUpload(_namespace: string, _uploadId: UploadId): Promise<true | RegistryError> {
     throw new Error("unimplemented");
   }
@@ -488,6 +493,7 @@ export class RegistryHTTPClient implements Registry {
     _expectedSha: string,
     _stream?: ReadableStream<any> | undefined,
     _length?: number | undefined,
+    _headers?: Headers | undefined,
   ): Promise<RegistryError | FinishedUploadObject> {
     throw new Error("unimplemented");
   }
