@@ -127,7 +127,6 @@ export async function getUploadState(
   env: Env,
   verifyHash: string | undefined,
 ): Promise<{ state: State; stateStr: string; hash: string } | RangeError | null> {
-  console.log("getUploadState", name, uploadId, verifyHash);
   const stateStr = await getJWT(env, { registryUploadId: uploadId, name: name });
   if (stateStr === null) {
     return null;
@@ -604,7 +603,7 @@ export class R2Registry implements Registry {
       const objectKey = `${namespace}/blobs/${opts.digest}`;
       const expirationSeconds = 24 * 60 * 60; // 24 hours
 
-      const requiresMultipart = !!(opts.size && opts.size > DIRECT_SINGLE_PUT_LIMIT);
+      const requiresMultipart = !!(opts.size && opts.size > DIRECT_DEFAULT_PART_SIZE);
       const bucket: R2Bucket & {
         createSignedUrl?: (options: {
           key: string;
