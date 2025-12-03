@@ -6,17 +6,35 @@ compatibility_flags = ["nodejs_compat"]
 
 ## Production
 [env.production]
+workers_dev = true
+preview_urls = true
+name = "runpod-registry-production"
 r2_buckets = [
-  { binding = "REGISTRY", bucket_name = "runpod-registry" }
+  { binding = "REGISTRY", bucket_name = "container-registry-bucket-prod" },
 ]
+routes = [
+  { pattern = "registry.runpod.net", zone_name = "runpod.net", custom_domain = true },
+]
+limits = { cpu_ms = 90000 }
+
+[env.production.vars]
+R2_PRESIGN_BUCKET_NAME = "container-registry-bucket-prod"
+R2_PRESIGN_ACCOUNT_ID = "14068d66ba387efac9ce5e4b1741bcf2"
 
 [env.development]
+preview_urls = true
+workers_dev = true
+name = "runpod-registry-development"
 r2_buckets = [
-  { binding = "REGISTRY", bucket_name = "runpod-registry" }
+  { binding = "REGISTRY", bucket_name = "container-registry-bucket-dev" },
+]
+routes = [
+  { pattern = "dev-registry.runpod.net", zone_name = "runpod.net", custom_domain = true },
 ]
 
-# Secrets:
-# USERNAME/PASSWORD/READONLY_USERNAME/READONLY_PASSWORD if you want username/password based auth
+[env.development.vars]
+R2_PRESIGN_BUCKET_NAME = "container-registry-bucket-dev"
+R2_PRESIGN_ACCOUNT_ID = "14068d66ba387efac9ce5e4b1741bcf2"
 
 [observability]
 enabled = true
