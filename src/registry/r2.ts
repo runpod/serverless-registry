@@ -40,6 +40,67 @@ const DIRECT_PARTS_HEADER = "x-registry-direct-parts";
 const DIRECT_OBJECT_POLL_ATTEMPTS = 6;
 const DIRECT_OBJECT_INITIAL_DELAY_MS = 200;
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SMALL_BLOB_POINTER_MAX_BYTES = 64; // if it is <= this, we can safely sniff it
+const META_REFERENCE_KEYS = ["X-Serverless-Registry-Reference", "x-serverless-registry-reference"];
+
+function getCustomMetadataCaseInsensitive(
+  obj: { customMetadata?: Record<string, string> },
+  key: string,
+): string | undefined {
+  const md = obj.customMetadata;
+  if (!md) return undefined;
+  if (md[key] !== undefined) return md[key];
+  const lower = key.toLowerCase();
+  for (const [k, v] of Object.entries(md)) {
+    if (k.toLowerCase() === lower) return v;
+  }
+  return undefined;
+}
+
+async function resolveUuidPointerIfNeeded(
+  env: Env,
+  digest: string,
+  obj: R2ObjectBody,
+): Promise<{ stream: ReadableStream; size: number; digest: string }> {
+  // legacy compat: some blobs were stored as a uuid pointer to a top-level object key
+  for (const k of META_REFERENCE_KEYS) {
+    const ref = getCustomMetadataCaseInsensitive(obj, k);
+    if (ref && UUID_RE.test(ref.trim())) {
+      const target = await env.REGISTRY.get(ref.trim());
+      if (target) {
+        // avoid leaking the original body stream when we return the referenced object
+        try {
+          await obj.body?.cancel();
+        } catch {
+          // ok whatever
+        }
+        return { stream: target.body!, size: target.size, digest };
+      }
+      break;
+    }
+  }
+
+  if (obj.size > SMALL_BLOB_POINTER_MAX_BYTES) {
+    return { stream: obj.body!, size: obj.size, digest };
+  }
+
+  const buf = await obj.arrayBuffer();
+  const text = new TextDecoder().decode(buf).trim();
+  if (!UUID_RE.test(text)) {
+    // not a pointer, just return the original bytes
+    return { stream: new Blob([buf]).stream(), size: buf.byteLength, digest };
+  }
+
+  const target = await env.REGISTRY.get(text);
+  if (!target) {
+    // pointer is dangling, fall back to returning the pointer bytes so callers can debug
+    return { stream: new Blob([buf]).stream(), size: buf.byteLength, digest };
+  }
+
+  return { stream: target.body!, size: target.size, digest };
+}
+
 export type Chunk =
   | {
       // Chunk that is less than 5GiB and respects the Chunk chain.
@@ -561,10 +622,12 @@ export class R2Registry implements Registry {
       };
     }
 
+    const resolved = await resolveUuidPointerIfNeeded(this.env, digest, res);
     return {
-      stream: res.body!,
-      digest: hexToDigest(res.checksums.sha256!),
-      size: res.size,
+      stream: resolved.stream,
+      // if the request was by digest, keep that digest stable even if the underlying r2 object lacks checksums
+      digest: digest.startsWith("sha256:") ? digest : hexToDigest(res.checksums.sha256!),
+      size: resolved.size,
     };
   }
 

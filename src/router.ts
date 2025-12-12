@@ -540,6 +540,38 @@ v2Router.head("/:name+/blobs/:tag", async (req, env: Env) => {
       size: res.size,
       exists: true,
     };
+
+    // if we're being asked by digest, keep it stable
+    if (tag.startsWith("sha256:")) {
+      layerExistsResponse.digest = tag;
+    }
+
+    // legacy compat: if the blob is a tiny reference stub, resolve size from the referenced object
+    if (res.size <= 64) {
+      const md = res.customMetadata ?? {};
+      const ref = md["X-Serverless-Registry-Reference"] ?? md["x-serverless-registry-reference"];
+      const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+      let key: string | undefined;
+      if (ref && uuidRe.test(ref.trim())) {
+        key = ref.trim();
+      } else {
+        // fallback: some older stubs just store the uuid as the blob body
+        const pointerObj = await env.REGISTRY.get(`${name}/blobs/${tag}`);
+        if (pointerObj) {
+          const buf = await pointerObj.arrayBuffer();
+          const text = new TextDecoder().decode(buf).trim();
+          if (uuidRe.test(text)) {
+            key = text;
+          }
+        }
+      }
+      if (key) {
+        const targetHead = await env.REGISTRY.head(key);
+        if (targetHead) {
+          layerExistsResponse.size = targetHead.size;
+        }
+      }
+    }
   }
 
   return new Response(null, {

@@ -75,6 +75,66 @@ describe("v2", () => {
     expect(response.status).toBe(200);
   });
 
+  test("GET /v2/:name/blobs/:digest resolves legacy uuid pointer blobs", async () => {
+    const name = "ptr-test";
+    const data = "hello-layer-bytes";
+    const digest = await getSHA256(data);
+    const uuid = crypto.randomUUID();
+    const bindings = env as Env;
+
+    // actual bytes live at the uuid key
+    await bindings.REGISTRY.put(uuid, data, { sha256: digest.slice(SHA256_PREFIX_LEN) });
+    // blob key contains just a uuid pointer (legacy layout)
+    await bindings.REGISTRY.put(`${name}/blobs/${digest}`, uuid);
+
+    const res = await fetch(createRequest("GET", `/v2/${name}/blobs/${digest}`, null));
+    expect(res.ok).toBeTruthy();
+    expect(res.headers.get("docker-content-digest")).toBe(digest);
+    expect(res.headers.get("content-length")).toBe(`${data.length}`);
+    expect(await res.text()).toBe(data);
+  });
+
+  test("GET /v2/:name/blobs/:digest resolves legacy reference metadata stubs", async () => {
+    const name = "ptr-meta-test";
+    const data = "hello-layer-bytes-meta";
+    const digest = await getSHA256(data);
+    const uuid = crypto.randomUUID();
+    const bindings = env as Env;
+
+    await bindings.REGISTRY.put(uuid, data, { sha256: digest.slice(SHA256_PREFIX_LEN) });
+    await bindings.REGISTRY.put(`${name}/blobs/${digest}`, uuid, {
+      customMetadata: {
+        "x-serverless-registry-reference": uuid,
+        "x-serverless-registry-digest": digest,
+      },
+    });
+
+    const res = await fetch(createRequest("GET", `/v2/${name}/blobs/${digest}`, null));
+    expect(res.ok).toBeTruthy();
+    expect(res.headers.get("docker-content-digest")).toBe(digest);
+    expect(res.headers.get("content-length")).toBe(`${data.length}`);
+    expect(await res.text()).toBe(data);
+
+    await bindings.REGISTRY.delete(`${name}/blobs/${digest}`);
+    await bindings.REGISTRY.delete(uuid);
+  });
+
+  test("HEAD /v2/:name/blobs/:digest resolves legacy uuid pointer blobs", async () => {
+    const name = "ptr-head-test";
+    const data = "hello-layer-bytes-2";
+    const digest = await getSHA256(data);
+    const uuid = crypto.randomUUID();
+    const bindings = env as Env;
+
+    await bindings.REGISTRY.put(uuid, data, { sha256: digest.slice(SHA256_PREFIX_LEN) });
+    await bindings.REGISTRY.put(`${name}/blobs/${digest}`, uuid);
+
+    const res = await fetch(createRequest("HEAD", `/v2/${name}/blobs/${digest}`, null));
+    expect(res.ok).toBeTruthy();
+    expect(res.headers.get("docker-content-digest")).toBe(digest);
+    expect(res.headers.get("content-length")).toBe(`${data.length}`);
+  });
+
   test("Username password authenticatiom fails gracefully when wrong format", async () => {
     const res = await fetchUnauth(
       createRequest("GET", `/v2/`, null, {
