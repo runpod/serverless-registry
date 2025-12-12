@@ -120,7 +120,8 @@ export class RegistryTokens implements Authenticator {
       // PULL or PUSH methods
       case "HEAD":
         // HEAD requests can be used by pushers like docker
-        if (!payload.capabilities.includes("pull") || !payload.capabilities.includes("push")) {
+        // accept either pull or push, since clients may HEAD before deciding which flow to use
+        if (!payload.capabilities.includes("pull") && !payload.capabilities.includes("push")) {
           console.warn(
             `verifyToken: failed jwt verification: missing any capability for HEAD request in ${request.url}`,
           );
@@ -206,6 +207,8 @@ export class RegistryTokens implements Authenticator {
 }
 
 const checkHasPermissionToImage = (payload: RegistryAuthProtocolTokenPayload, request: Request) => {
+  // if the token isn't scoped to an image, don't enforce image matching
+  if (!payload?.imageName) return true;
   const split = request.url.split("/");
   let hasImageName = false;
   for (const part of split) {
