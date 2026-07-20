@@ -252,6 +252,33 @@ describe("v2 manifests", () => {
     await bindings.REGISTRY.delete(`${name}/manifests/${reference}`);
   });
 
+  test("PUT /v2/:name/manifests/:reference rejects a mismatched sha256 digest", async () => {
+    const name = "manifest-digest-mismatch";
+    const data = JSON.stringify(await generateManifest(name));
+    const contentDigest = await getSHA256(data);
+    const reference = `sha256:${"0".repeat(64)}`;
+    const response = await fetch(
+      createRequest("PUT", `/v2/${name}/manifests/${reference}`, new Blob([data]).stream(), {
+        "Content-Type": "application/gzip",
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      errors: [
+        {
+          code: "DIGEST_INVALID",
+          message: `provided digest ${reference} does not match content digest ${contentDigest}`,
+          detail: {},
+        },
+      ],
+    });
+
+    const bindings = env as Env;
+    expect(await bindings.REGISTRY.head(`${name}/manifests/${reference}`)).toBeNull();
+    expect(await bindings.REGISTRY.head(`${name}/manifests/${contentDigest}`)).toBeNull();
+  });
+
   test("PUT then DELETE /v2/:name/manifests/:reference works", async () => {
     const { sha256 } = await createManifest("hello-world", await generateManifest("hello-world"), "hello");
     const bindings = env as Env;
