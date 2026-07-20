@@ -74,7 +74,7 @@ export class RegistryTokens implements Authenticator {
     return token;
   }
 
-  static checkIfV2OnlyPath(request: Request): boolean {
+  static checkIfRegistryBasePath(request: Request): boolean {
     const pathname = new URL(request.url).pathname;
     return pathname === "/" || pathname === "/v2/";
   }
@@ -141,7 +141,7 @@ export class RegistryTokens implements Authenticator {
         break;
       // PULL method
       case "GET": {
-        const isRegistryBasePath = RegistryTokens.checkIfV2OnlyPath(request);
+        const isRegistryBasePath = RegistryTokens.checkIfRegistryBasePath(request);
         if (isRegistryBasePath && payload.capabilities.length === 0) {
           console.warn(
             "verifyToken: failed jwt verification: missing any capabilities for GET request to registry base path",
