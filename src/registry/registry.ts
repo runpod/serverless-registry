@@ -2,7 +2,7 @@ import { Env } from "../..";
 import { InternalError } from "../errors";
 import { errorString } from "../utils";
 import z from "zod";
-import { GarbageCollectionMode } from "./garbage-collector";
+import { GarbageCollectionMode, GarbageCollectionResult } from "./garbage-collector";
 
 // Defines a registry and how it's configured
 const registryConfiguration = z.object({
@@ -192,7 +192,11 @@ export interface Registry {
     headers?: Headers,
   ): Promise<FinishedUploadObject | RegistryError>;
 
-  garbageCollection(namespace: string, mode: GarbageCollectionMode): Promise<boolean>;
+  garbageCollection(
+    namespace: string,
+    mode: GarbageCollectionMode,
+    options?: { dryRun?: boolean; excludedReferences?: string[] },
+  ): Promise<GarbageCollectionResult>;
 }
 
 export function wrapError(method: string, err: unknown): RegistryError {

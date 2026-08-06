@@ -30,8 +30,9 @@ import {
   UploadObject,
   wrapError,
 } from "./registry";
-import { GarbageCollectionMode, GarbageCollector } from "./garbage-collector";
+import { DEFAULT_GC_MINIMUM_OBJECT_AGE_MS, GarbageCollectionMode, GarbageCollector } from "./garbage-collector";
 import { ManifestSchema, manifestSchema } from "../manifest";
+import { getRegistryReferenceFromMetadata, parseRegistryReference, SMALL_BLOB_POINTER_MAX_BYTES } from "./references";
 
 const DIRECT_SINGLE_PUT_LIMIT = 5 * 1024 * 1024 * 1024; // 5GiB
 const DIRECT_MIN_PART_SIZE = 5 * 1024 * 1024; // 5MiB
@@ -40,44 +41,21 @@ const DIRECT_PARTS_HEADER = "x-registry-direct-parts";
 const DIRECT_OBJECT_POLL_ATTEMPTS = 6;
 const DIRECT_OBJECT_INITIAL_DELAY_MS = 200;
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const SMALL_BLOB_POINTER_MAX_BYTES = 64; // if it is <= this, we can safely sniff it
-const META_REFERENCE_KEYS = ["X-Serverless-Registry-Reference", "x-serverless-registry-reference"];
-
-function getCustomMetadataCaseInsensitive(
-  obj: { customMetadata?: Record<string, string> },
-  key: string,
-): string | undefined {
-  const md = obj.customMetadata;
-  if (!md) return undefined;
-  if (md[key] !== undefined) return md[key];
-  const lower = key.toLowerCase();
-  for (const [k, v] of Object.entries(md)) {
-    if (k.toLowerCase() === lower) return v;
-  }
-  return undefined;
-}
-
 async function resolveUuidPointerIfNeeded(
   env: Env,
   digest: string,
   obj: R2ObjectBody,
 ): Promise<{ stream: ReadableStream; size: number; digest: string }> {
-  // legacy compat: some blobs were stored as a uuid pointer to a top-level object key
-  for (const k of META_REFERENCE_KEYS) {
-    const ref = getCustomMetadataCaseInsensitive(obj, k);
-    if (ref && UUID_RE.test(ref.trim())) {
-      const target = await env.REGISTRY.get(ref.trim());
-      if (target) {
-        // avoid leaking the original body stream when we return the referenced object
-        try {
-          await obj.body?.cancel();
-        } catch {
-          // ok whatever
-        }
-        return { stream: target.body!, size: target.size, digest };
+  const metadataReference = getRegistryReferenceFromMetadata(obj);
+  if (metadataReference) {
+    const target = await env.REGISTRY.get(metadataReference);
+    if (target) {
+      try {
+        await obj.body?.cancel();
+      } catch {
+        // body cancellation is best-effort
       }
-      break;
+      return { stream: target.body!, size: target.size, digest };
     }
   }
 
@@ -86,15 +64,13 @@ async function resolveUuidPointerIfNeeded(
   }
 
   const buf = await obj.arrayBuffer();
-  const text = new TextDecoder().decode(buf).trim();
-  if (!UUID_RE.test(text)) {
-    // not a pointer, just return the original bytes
+  const reference = parseRegistryReference(new TextDecoder().decode(buf));
+  if (!reference) {
     return { stream: new Blob([buf]).stream(), size: buf.byteLength, digest };
   }
 
-  const target = await env.REGISTRY.get(text);
+  const target = await env.REGISTRY.get(reference);
   if (!target) {
-    // pointer is dangling, fall back to returning the pointer bytes so callers can debug
     return { stream: new Blob([buf]).stream(), size: buf.byteLength, digest };
   }
 
@@ -345,7 +321,12 @@ export class R2Registry implements Registry {
   private gc: GarbageCollector;
 
   constructor(private env: Env) {
-    this.gc = new GarbageCollector(this.env.REGISTRY);
+    const configuredMinimumAge = Number(this.env.GC_MINIMUM_OBJECT_AGE_MS);
+    const minimumObjectAgeMs =
+      Number.isFinite(configuredMinimumAge) && configuredMinimumAge >= 0
+        ? configuredMinimumAge
+        : DEFAULT_GC_MINIMUM_OBJECT_AGE_MS;
+    this.gc = new GarbageCollector(this.env.REGISTRY, minimumObjectAgeMs);
   }
 
   async manifestExists(name: string, reference: string): Promise<RegistryError | CheckManifestResponse> {
@@ -1191,8 +1172,11 @@ export class R2Registry implements Registry {
     };
   }
 
-  async garbageCollection(namespace: string, mode: GarbageCollectionMode): Promise<boolean> {
-    const result = await this.gc.collect({ name: namespace, mode: mode });
-    return result;
+  async garbageCollection(
+    namespace: string,
+    mode: GarbageCollectionMode,
+    options?: { dryRun?: boolean; excludedReferences?: string[] },
+  ) {
+    return this.gc.collect({ name: namespace, mode, ...options });
   }
 }

@@ -37,21 +37,32 @@ will still be around taking space.
 
 ## Removing an image and triggering the garbage collection
 
-To delete an image of your registry, you can use `skopeo delete` or an API call:
+To delete an image tag, use `skopeo delete` or an API call:
 
 ```
 # If you pushed to serverless.workers.dev/my-image:latest
-curl -X DELETE -X "Authorization: $CREDENTIAL" https://serverless.workers.dev/my-image/manifests/latest
-# You will also need to remove the digest reference
-curl -X DELETE -X "Authorization: $CREDENTIAL" https://serverless.workers.dev/my-image/manifests/<digest>
+curl -X DELETE -H "Authorization: $CREDENTIAL" https://serverless.workers.dev/my-image/manifests/latest
 ```
 
-The layer still exists in the registry, but we can remove it by triggering the garbage collector.
+The digest manifest and unreferenced layers can then be reclaimed with untagged garbage collection.
 
 ```
-curl -X POST -H "Authorization: $CREDENTIAL" https://serverless.workers.dev/my-image/gc
-{"success":true}
+curl -X POST -H "Authorization: $CREDENTIAL" "https://serverless.workers.dev/my-image/gc?mode=untagged"
+{"success":true,"objectCount":4,"bytes":128000}
 ```
+
+A dry run calculates the objects and bytes that would be reclaimed after removing a bounded set of tags. It does not mutate registry data.
+
+```
+curl -X POST \
+  -H "Authorization: $CREDENTIAL" \
+  -H "Content-Type: application/json" \
+  -d '{"references":["latest","previous"]}' \
+  "https://serverless.workers.dev/my-image/gc?mode=untagged&dry_run=true"
+{"success":true,"objectCount":8,"bytes":256000}
+```
+
+Objects uploaded within the last hour and blobs attached to active direct uploads remain available for in-progress pushes.
 
 ## How does it work
 

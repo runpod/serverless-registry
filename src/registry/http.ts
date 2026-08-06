@@ -1,7 +1,7 @@
 import { Env } from "../..";
 import { InternalError } from "../errors";
 import { errorString } from "../utils";
-import { GarbageCollectionMode } from "./garbage-collector";
+import { GarbageCollectionMode, GarbageCollectionResult } from "./garbage-collector";
 import {
   CheckLayerResponse,
   CheckManifestResponse,
@@ -502,7 +502,11 @@ export class RegistryHTTPClient implements Registry {
     throw new Error("unimplemented");
   }
 
-  garbageCollection(_namespace: string, _mode: GarbageCollectionMode): Promise<boolean> {
+  garbageCollection(
+    _namespace: string,
+    _mode: GarbageCollectionMode,
+    _options?: { dryRun?: boolean; excludedReferences?: string[] },
+  ): Promise<GarbageCollectionResult> {
     throw new Error("unimplemented");
   }
 }

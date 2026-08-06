@@ -21,9 +21,61 @@ import {
 import { RegistryHTTPClient } from "./registry/http";
 
 const v2Router = Router({ base: "/v2/" });
+const TAG_REFERENCE_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/;
 
 v2Router.get("/", async (_req, _env: Env) => {
   return new Response();
+});
+
+v2Router.get("/_maintenance/repositories", async (req, env: Env) => {
+  const requestedLimit = Number(req.query.limit ?? 100);
+  const limit = Number.isFinite(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 1000) : 100;
+  let cursor = req.query.cursor?.toString();
+  const repositories = new Set<string>();
+  let pages = 0;
+
+  do {
+    const page = await env.REGISTRY.list({
+      delimiter: "/",
+      limit: Math.max(1, limit - repositories.size),
+      cursor,
+    });
+    page.delimitedPrefixes.forEach((prefix) => repositories.add(prefix.replace(/\/$/, "")));
+    cursor = page.truncated ? page.cursor : undefined;
+    pages++;
+  } while (cursor && repositories.size < limit && pages < 50);
+
+  return new Response(
+    JSON.stringify({
+      repositories: [...repositories],
+      cursor,
+    }),
+    { headers: jsonHeaders() },
+  );
+});
+
+v2Router.get("/_maintenance/:name+/tags", async (req, env: Env) => {
+  const requestedLimit = Number(req.query.limit ?? 1000);
+  const limit = Number.isFinite(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 1000) : 1000;
+  const { name } = req.params;
+  const page = await env.REGISTRY.list({
+    prefix: `${name}/manifests/`,
+    limit,
+    cursor: req.query.cursor?.toString(),
+  });
+  const tags = page.objects.flatMap((object) => {
+    const reference = object.key.slice(`${name}/manifests/`.length);
+    if (!TAG_REFERENCE_PATTERN.test(reference)) return [];
+    return [{ reference, uploadedAt: object.uploaded.toISOString() }];
+  });
+
+  return new Response(
+    JSON.stringify({
+      tags,
+      cursor: page.truncated ? page.cursor : undefined,
+    }),
+    { headers: jsonHeaders() },
+  );
 });
 
 v2Router.get("/_catalog", async (req, env: Env) => {
@@ -50,25 +102,22 @@ v2Router.get("/_catalog", async (req, env: Env) => {
 });
 
 v2Router.delete("/:name+/manifests/:reference", async (req, env: Env) => {
-  // deleting a manifest works by retrieving the """main""" manifest that its key is a sha,
-  // and then going through every tag and removing it
-  //
-  // after removing every tag, it's safe to remove the main manifest.
-  //
-  // if the transaction ends in an inconsistent state, the client can call this endpoint again
-  // and we would try to delete everything again
-  //
-  // we limit 1k tag deletions per request. If more we will return an error so client retries.
-  //
-  // If somehow we need to remove by paginating, we accept a last query param
-
+  // digest deletion removes every matching tag before deleting the digest manifest.
   const { last, limit } = req.query;
   const { name, reference } = req.params;
-  // Reference is ALWAYS a sha256
   const manifest = await env.REGISTRY.head(`${name}/manifests/${reference}`);
   if (manifest === null) {
     return new Response(JSON.stringify(ManifestUnknownError(reference)), { status: 404, headers: jsonHeaders() });
   }
+
+  if (!reference.startsWith("sha256:")) {
+    await env.REGISTRY.delete(`${name}/manifests/${reference}`);
+    return new Response("", {
+      status: 202,
+      headers: { "Content-Length": "None" },
+    });
+  }
+
   const limitInt = parseInt(limit?.toString() ?? "1000", 10);
   const tags = await env.REGISTRY.list({
     prefix: `${name}/manifests`,
@@ -641,8 +690,32 @@ v2Router.post("/:name+/gc", async (req, env: Env) => {
   if (mode !== "unreferenced" && mode !== "untagged") {
     throw new ServerError("Mode must be either 'unreferenced' or 'untagged'", 400);
   }
-  const result = await env.REGISTRY_CLIENT.garbageCollection(name, mode);
-  return new Response(JSON.stringify({ success: result }));
+
+  const dryRun = req.query.dry_run === "true";
+  let excludedReferences: string[] | undefined;
+  if (dryRun) {
+    let payload: unknown;
+    try {
+      payload = await req.json();
+    } catch {
+      throw new ServerError("Dry-run garbage collection requires a JSON body", 400);
+    }
+    const references = (payload as { references?: unknown })?.references;
+    if (
+      !Array.isArray(references) ||
+      references.length > 100 ||
+      !references.every((reference) => typeof reference === "string" && TAG_REFERENCE_PATTERN.test(reference))
+    ) {
+      throw new ServerError("Dry-run garbage collection references are invalid", 400);
+    }
+    excludedReferences = [...new Set(references)];
+  }
+
+  const result = await env.REGISTRY_CLIENT.garbageCollection(name, mode, {
+    dryRun,
+    excludedReferences,
+  });
+  return new Response(JSON.stringify(result), { headers: jsonHeaders() });
 });
 
 export default v2Router;

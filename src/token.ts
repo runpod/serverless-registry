@@ -82,6 +82,10 @@ export class RegistryTokens implements Authenticator {
     return new URL(request.url).pathname.endsWith("/gc");
   }
 
+  static checkIfMaintenancePath(request: Request): boolean {
+    return new URL(request.url).pathname.startsWith("/v2/_maintenance/");
+  }
+
   async verifyToken(
     request: Request,
     token: string,
@@ -156,6 +160,12 @@ export class RegistryTokens implements Authenticator {
         if (!payload.capabilities.includes("pull")) {
           console.warn(
             `verifyToken: failed jwt verification: missing "pull" capability for ${request.method} HTTP method in ${request.url}`,
+          );
+          return { verified: false, payload: null };
+        }
+        if (RegistryTokens.checkIfMaintenancePath(request) && !payload.capabilities.includes("delete")) {
+          console.warn(
+            `verifyToken: failed jwt verification: missing "delete" capability for maintenance path in ${request.url}`,
           );
           return { verified: false, payload: null };
         }
