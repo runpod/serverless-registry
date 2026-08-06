@@ -291,6 +291,74 @@ describe("v2 manifests", () => {
     expect(listObjectsAfterGC.objects.length).toEqual(0);
   });
 
+  test("tag deletion requires the expected digest", async () => {
+    const name = "conditional-tag-delete";
+    const manifest = await generateManifest(name);
+    const { sha256: oldDigest } = await createManifest(
+      name,
+      { ...manifest, annotations: { version: "old" } },
+      "build",
+    );
+    const { sha256: currentDigest } = await createManifest(
+      name,
+      { ...manifest, annotations: { version: "current" } },
+      "build",
+    );
+
+    const staleDelete = await fetch(
+      createRequest("DELETE", `/v2/${name}/manifests/build`, null, {
+        "X-Runpod-Expected-Digest": oldDigest,
+      }),
+    );
+    expect(staleDelete.status).toBe(412);
+
+    const current = await fetch(createRequest("HEAD", `/v2/${name}/manifests/build`, null));
+    expect(current.headers.get("docker-content-digest")).toBe(currentDigest);
+
+    const currentDelete = await fetch(
+      createRequest("DELETE", `/v2/${name}/manifests/build`, null, {
+        "X-Runpod-Expected-Digest": currentDigest,
+      }),
+    );
+    expect(currentDelete.status).toBe(202);
+  });
+
+  test("deletion claims block tag reads and writes until final deletion", async () => {
+    const name = "claimed-tag-delete";
+    const manifest = await generateManifest(name);
+    const { sha256 } = await createManifest(name, manifest, "build");
+
+    const claimResponse = await fetch(
+      createRequest(
+        "POST",
+        `/v2/_maintenance/${name}/tags/build/claim`,
+        new Blob([JSON.stringify({ digest: sha256 })]).stream(),
+        { "Content-Type": "application/json" },
+      ),
+    );
+    expect(claimResponse.status).toBe(201);
+    const claim = (await claimResponse.json()) as { token: string };
+
+    const claimedHead = await fetch(createRequest("HEAD", `/v2/${name}/manifests/build`, null));
+    expect(claimedHead.status).toBe(423);
+
+    const replacement = JSON.stringify({ ...manifest, annotations: { version: "replacement" } });
+    const claimedPut = await fetch(
+      createRequest("PUT", `/v2/${name}/manifests/build`, new Blob([replacement]).stream(), {
+        "Content-Type": "application/gzip",
+      }),
+    );
+    expect(claimedPut.status).toBe(409);
+
+    const deleteResponse = await fetch(
+      createRequest("DELETE", `/v2/${name}/manifests/build`, null, {
+        "X-Runpod-Deletion-Claim": claim.token,
+        "X-Runpod-Expected-Digest": sha256,
+      }),
+    );
+    expect(deleteResponse.status).toBe(202);
+  });
+
   test("untagged garbage collection removes digest manifests after tag deletion", async () => {
     const name = "gc-untagged-manifest";
     const manifest = await generateManifest(name);
@@ -650,11 +718,16 @@ describe("tokens", async () => {
     expect(verified).toBeFalsy();
   });
 
-  test("auth payload pull and delete can read maintenance inventory", async () => {
-    const { verified } = RegistryTokens.verifyPayload(createRequest("GET", "/v2/_maintenance/repositories", null), {
-      capabilities: ["pull", "delete"],
-    } as RegistryAuthProtocolTokenPayload);
-    expect(verified).toBeTruthy();
+  test("auth payload pull and delete can use maintenance routes", async () => {
+    for (const method of ["GET", "POST", "DELETE"]) {
+      const { verified } = RegistryTokens.verifyPayload(
+        createRequest(method, "/v2/_maintenance/whatever/tags/build/claim", null),
+        {
+          capabilities: ["pull", "delete"],
+        } as RegistryAuthProtocolTokenPayload,
+      );
+      expect(verified).toBeTruthy();
+    }
   });
 
   test("auth payload push on GET", async () => {
@@ -807,12 +880,13 @@ describe("maintenance inventory", () => {
     const response = await fetch(createRequest("GET", "/v2/_maintenance/maintenance-repo-a/tags", null));
     expect(response.ok).toBeTruthy();
     const page = (await response.json()) as {
-      tags: Array<{ reference: string; uploadedAt: string }>;
+      tags: Array<{ reference: string; digest: string; uploadedAt: string }>;
     };
 
     expect(page.tags).toEqual([
       expect.objectContaining({
         reference: "build-a",
+        digest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
         uploadedAt: expect.any(String),
       }),
     ]);

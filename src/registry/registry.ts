@@ -118,6 +118,14 @@ export type PutManifestResponse = {
   location: string;
 };
 
+export type DeleteManifestTagResponse =
+  | { deleted: true }
+  | { deleted: false; reason: "not_found" | "digest_mismatch" | "claim_mismatch" };
+
+export type ManifestTagClaimResponse =
+  | { claimed: true; token: string }
+  | { claimed: false; reason: "not_found" | "digest_mismatch" | "already_claimed" };
+
 // Registry interface to an implementation
 export interface Registry {
   // All read operations supported by a registry
@@ -144,6 +152,21 @@ export interface Registry {
     readableStream: ReadableStream<any>,
     contentType: string,
   ): Promise<PutManifestResponse | RegistryError>;
+
+  claimManifestTag(
+    namespace: string,
+    reference: string,
+    expectedDigest: string,
+  ): Promise<ManifestTagClaimResponse>;
+
+  releaseManifestTagClaim(namespace: string, reference: string, token: string): Promise<boolean>;
+
+  deleteManifestTag(
+    namespace: string,
+    reference: string,
+    expectedDigest?: string,
+    claimToken?: string,
+  ): Promise<DeleteManifestTagResponse>;
 
   // starts a new upload
   startUpload(namespace: string): Promise<UploadObject | RegistryError>;

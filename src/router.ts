@@ -22,6 +22,7 @@ import { RegistryHTTPClient } from "./registry/http";
 
 const v2Router = Router({ base: "/v2/" });
 const TAG_REFERENCE_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/;
+const DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/;
 
 v2Router.get("/", async (_req, _env: Env) => {
   return new Response();
@@ -65,8 +66,14 @@ v2Router.get("/_maintenance/:name+/tags", async (req, env: Env) => {
   });
   const tags = page.objects.flatMap((object) => {
     const reference = object.key.slice(`${name}/manifests/`.length);
-    if (!TAG_REFERENCE_PATTERN.test(reference)) return [];
-    return [{ reference, uploadedAt: object.uploaded.toISOString() }];
+    if (!TAG_REFERENCE_PATTERN.test(reference) || !object.checksums.sha256) return [];
+    return [
+      {
+        reference,
+        digest: hexToDigest(object.checksums.sha256),
+        uploadedAt: object.uploaded.toISOString(),
+      },
+    ];
   });
 
   return new Response(
@@ -76,6 +83,43 @@ v2Router.get("/_maintenance/:name+/tags", async (req, env: Env) => {
     }),
     { headers: jsonHeaders() },
   );
+});
+
+v2Router.post("/_maintenance/:name+/tags/:reference/claim", async (req, env: Env) => {
+  const { name, reference } = req.params;
+  if (!TAG_REFERENCE_PATTERN.test(reference)) {
+    return new Response(JSON.stringify({ error: "invalid tag reference" }), {
+      status: 400,
+      headers: jsonHeaders(),
+    });
+  }
+
+  const body = await req.json<{ digest?: unknown }>().catch(() => null);
+  if (!body || typeof body.digest !== "string" || !DIGEST_PATTERN.test(body.digest)) {
+    return new Response(JSON.stringify({ error: "invalid expected digest" }), {
+      status: 400,
+      headers: jsonHeaders(),
+    });
+  }
+
+  const result = await env.REGISTRY_CLIENT.claimManifestTag(name, reference, body.digest);
+  if (!result.claimed) {
+    const status = result.reason === "not_found" ? 404 : result.reason === "digest_mismatch" ? 412 : 409;
+    return new Response(JSON.stringify({ error: result.reason }), { status, headers: jsonHeaders() });
+  }
+  return new Response(JSON.stringify({ token: result.token }), { status: 201, headers: jsonHeaders() });
+});
+
+v2Router.delete("/_maintenance/:name+/tags/:reference/claim", async (req, env: Env) => {
+  const token = req.headers.get("X-Runpod-Deletion-Claim");
+  if (!token) {
+    return new Response(JSON.stringify({ error: "missing deletion claim" }), {
+      status: 400,
+      headers: jsonHeaders(),
+    });
+  }
+  const released = await env.REGISTRY_CLIENT.releaseManifestTagClaim(req.params.name, req.params.reference, token);
+  return new Response(null, { status: released ? 204 : 409 });
 });
 
 v2Router.get("/_catalog", async (req, env: Env) => {
@@ -102,20 +146,33 @@ v2Router.get("/_catalog", async (req, env: Env) => {
 });
 
 v2Router.delete("/:name+/manifests/:reference", async (req, env: Env) => {
-  // digest deletion removes every matching tag before deleting the digest manifest.
   const { last, limit } = req.query;
   const { name, reference } = req.params;
-  const manifest = await env.REGISTRY.head(`${name}/manifests/${reference}`);
-  if (manifest === null) {
-    return new Response(JSON.stringify(ManifestUnknownError(reference)), { status: 404, headers: jsonHeaders() });
-  }
 
   if (!reference.startsWith("sha256:")) {
-    await env.REGISTRY.delete(`${name}/manifests/${reference}`);
+    const expectedDigest = req.headers.get("X-Runpod-Expected-Digest") ?? undefined;
+    if (expectedDigest && !DIGEST_PATTERN.test(expectedDigest)) {
+      return new Response(JSON.stringify({ error: "invalid expected digest" }), {
+        status: 400,
+        headers: jsonHeaders(),
+      });
+    }
+
+    const claimToken = req.headers.get("X-Runpod-Deletion-Claim") ?? undefined;
+    const result = await env.REGISTRY_CLIENT.deleteManifestTag(name, reference, expectedDigest, claimToken);
+    if (!result.deleted) {
+      const status = result.reason === "not_found" ? 404 : result.reason === "digest_mismatch" ? 412 : 409;
+      return new Response(JSON.stringify({ error: result.reason }), { status, headers: jsonHeaders() });
+    }
     return new Response("", {
       status: 202,
       headers: { "Content-Length": "None" },
     });
+  }
+
+  const manifest = await env.REGISTRY.head(`${name}/manifests/${reference}`);
+  if (manifest === null) {
+    return new Response(JSON.stringify(ManifestUnknownError(reference)), { status: 404, headers: jsonHeaders() });
   }
 
   const limitInt = parseInt(limit?.toString() ?? "1000", 10);
@@ -166,6 +223,8 @@ v2Router.head("/:name+/manifests/:reference", async (req, env: Env) => {
       },
     });
   }
+
+  if ("response" in res && res.response.status === 423) return res.response;
 
   let checkManifestResponse: CheckManifestResponse | null = null;
   const registryList = registries(env);
@@ -235,6 +294,8 @@ v2Router.get("/:name+/manifests/:reference", async (req, env: Env, context: Exec
       },
     });
   }
+
+  if ("response" in res && res.response.status === 423) return res.response;
 
   let getManifestResponse: GetManifestResponse | null = null;
   const registriesList = registries(env);

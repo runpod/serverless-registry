@@ -17,12 +17,14 @@ import { BlobUnknownError, ManifestUnknownError } from "../v2-errors";
 import {
   CheckLayerResponse,
   CheckManifestResponse,
+  DeleteManifestTagResponse,
   DirectUploadPart,
   DirectUploadInfo,
   FinishedUploadObject,
   GetLayerResponse,
   GetManifestResponse,
   ListRepositoriesResponse,
+  ManifestTagClaimResponse,
   PutManifestResponse,
   Registry,
   RegistryError,
@@ -40,6 +42,7 @@ const DIRECT_DEFAULT_PART_SIZE = 512 * 1024 * 1024; // 512MiB
 const DIRECT_PARTS_HEADER = "x-registry-direct-parts";
 const DIRECT_OBJECT_POLL_ATTEMPTS = 6;
 const DIRECT_OBJECT_INITIAL_DELAY_MS = 200;
+const DELETION_CLAIM_MAX_AGE_MS = 15 * 60 * 1000;
 
 async function resolveUuidPointerIfNeeded(
   env: Env,
@@ -329,7 +332,20 @@ export class R2Registry implements Registry {
     this.gc = new GarbageCollector(this.env.REGISTRY, minimumObjectAgeMs);
   }
 
+  private deletionClaimKey(name: string, reference: string): string {
+    return `${name}/deletion-claims/${reference}`;
+  }
+
+  private async getDeletionClaim(name: string, reference: string): Promise<R2Object | null> {
+    const claim = await this.env.REGISTRY.head(this.deletionClaimKey(name, reference));
+    if (!claim || claim.uploaded.getTime() + DELETION_CLAIM_MAX_AGE_MS <= Date.now()) return null;
+    return claim;
+  }
+
   async manifestExists(name: string, reference: string): Promise<RegistryError | CheckManifestResponse> {
+    if (!reference.startsWith("sha256:") && (await this.getDeletionClaim(name, reference))) {
+      return { response: new Response("manifest tag is pending deletion", { status: 423 }) };
+    }
     const [res, err] = await wrap(this.env.REGISTRY.head(`${name}/manifests/${reference}`));
     if (err) {
       return wrapError("manifestExists", err);
@@ -498,6 +514,77 @@ export class R2Registry implements Registry {
     }
   }
 
+  async claimManifestTag(
+    name: string,
+    reference: string,
+    expectedDigest: string,
+  ): Promise<ManifestTagClaimResponse> {
+    return this.gc.withGarbageCollectionLock(name, async () => {
+      const claimKey = this.deletionClaimKey(name, reference);
+      const existingClaim = await this.env.REGISTRY.head(claimKey);
+      if (existingClaim && existingClaim.uploaded.getTime() + DELETION_CLAIM_MAX_AGE_MS > Date.now()) {
+        return { claimed: false, reason: "already_claimed" };
+      }
+      if (existingClaim) await this.env.REGISTRY.delete(claimKey);
+
+      const object = await this.env.REGISTRY.head(`${name}/manifests/${reference}`);
+      if (!object) return { claimed: false, reason: "not_found" };
+      if (!object.checksums.sha256) {
+        throw new ServerError("manifest is missing its sha256 checksum");
+      }
+      if (hexToDigest(object.checksums.sha256) !== expectedDigest) {
+        return { claimed: false, reason: "digest_mismatch" };
+      }
+
+      const token = crypto.randomUUID();
+      await this.env.REGISTRY.put(claimKey, token, {
+        customMetadata: { token, digest: expectedDigest },
+      });
+      return { claimed: true, token };
+    });
+  }
+
+  async releaseManifestTagClaim(name: string, reference: string, token: string): Promise<boolean> {
+    return this.gc.withGarbageCollectionLock(name, async () => {
+      const claim = await this.getDeletionClaim(name, reference);
+      if (!claim || claim.customMetadata?.token !== token) return false;
+      await this.env.REGISTRY.delete(claim.key);
+      return true;
+    });
+  }
+
+  async deleteManifestTag(
+    name: string,
+    reference: string,
+    expectedDigest?: string,
+    claimToken?: string,
+  ): Promise<DeleteManifestTagResponse> {
+    return this.gc.withGarbageCollectionLock(name, async () => {
+      const claim = await this.getDeletionClaim(name, reference);
+      if (claim && (!claimToken || claim.customMetadata?.token !== claimToken)) {
+        return { deleted: false, reason: "claim_mismatch" };
+      }
+      if (claimToken && !claim) return { deleted: false, reason: "claim_mismatch" };
+
+      const object = await this.env.REGISTRY.head(`${name}/manifests/${reference}`);
+      if (!object) return { deleted: false, reason: "not_found" };
+      if (!object.checksums.sha256) {
+        throw new ServerError("manifest is missing its sha256 checksum");
+      }
+
+      const digest = hexToDigest(object.checksums.sha256);
+      if (expectedDigest && digest !== expectedDigest) {
+        return { deleted: false, reason: "digest_mismatch" };
+      }
+      if (claim && claim.customMetadata?.digest !== digest) {
+        return { deleted: false, reason: "digest_mismatch" };
+      }
+
+      await this.env.REGISTRY.delete(claim ? [object.key, claim.key] : object.key);
+      return { deleted: true };
+    });
+  }
+
   async putManifestInner(
     name: string,
     reference: string,
@@ -517,6 +604,9 @@ export class R2Registry implements Registry {
     const text = await blob.text();
     const manifestJSON = JSON.parse(text);
     const manifest = manifestSchema.parse(manifestJSON);
+    if (reference !== digestStr && (await this.getDeletionClaim(name, reference))) {
+      return { response: new ServerError("manifest tag is pending deletion", 409) };
+    }
     const verifyManifestErr = await this.verifyManifest(name, manifest);
     if (verifyManifestErr !== null) return { response: verifyManifestErr };
 
@@ -553,6 +643,9 @@ export class R2Registry implements Registry {
   }
 
   async getManifest(name: string, reference: string): Promise<RegistryError | GetManifestResponse> {
+    if (!reference.startsWith("sha256:") && (await this.getDeletionClaim(name, reference))) {
+      return { response: new Response("manifest tag is pending deletion", { status: 423 }) };
+    }
     const [res, err] = await wrap(this.env.REGISTRY.get(`${name}/manifests/${reference}`));
     if (err) {
       return wrapError("getManifest", err);

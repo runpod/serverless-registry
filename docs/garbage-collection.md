@@ -37,12 +37,17 @@ will still be around taking space.
 
 ## Removing an image and triggering the garbage collection
 
-To delete an image tag, use `skopeo delete` or an API call:
+To delete an image tag, use `skopeo delete` or an API call. Maintenance clients can include the inventory digest so deletion fails if the tag points to different content.
 
 ```
 # If you pushed to serverless.workers.dev/my-image:latest
-curl -X DELETE -H "Authorization: $CREDENTIAL" https://serverless.workers.dev/my-image/manifests/latest
+curl -X DELETE \
+  -H "Authorization: $CREDENTIAL" \
+  -H "X-Runpod-Expected-Digest: sha256:..." \
+  https://serverless.workers.dev/my-image/manifests/latest
 ```
+
+Maintenance cleanup first claims a tag with its inventory digest. Claimed tags reject reads and writes while the caller revalidates external references, and claims expire after 15 minutes if a caller stops before releasing or deleting them. Final deletion requires both the claim token and the same digest.
 
 The digest manifest and unreferenced layers can then be reclaimed with untagged garbage collection.
 
@@ -66,12 +71,9 @@ Objects uploaded within the last hour and blobs attached to active direct upload
 
 ## How does it work
 
-How do we remove them? We take the approach of listing all manifests in a namespace and storing its digests
-in a Set, then we list all the layers and those that are not in the Set get removed. That has a big drawback
-that means we might be removing layers that don't have a manifest but are about to have one at the end of their push.
+Reachability is evaluated in bounded memory with conservative Bloom filters. Tagged and recent manifests seed the live set, and bounded passes propagate reachability through OCI indexes, subjects, and referrers. Bloom-filter false positives retain extra objects, so they cannot cause live data to be reclaimed. Manifest bodies are processed one at a time.
 
-In serverless-registry, if we remove a layer garbage collecting the manifest endpoint will throw a BLOB_UNKNOWN
-error, but the garbage collector can still race with that endpont, so we go back to square one.
+Live manifests seed another bounded filter for configs and layers. Active uploads and legacy pointer targets are added before unreferenced objects are processed in bounded deletion batches.
 
 Some registries take a lock stop the world approach, however serverless-registry can't really do that due
 to its objective of only using R2. However, we need to fail whenever a race condition happens, a data

@@ -1,7 +1,3 @@
-// We have 2 modes for the garbage collector, unreferenced and untagged.
-// Unreferenced will delete all blobs that are not referenced by any manifest.
-// Untagged will delete all blobs that are not referenced by any manifest and are not tagged.
-
 import jwt from "@tsndr/cloudflare-worker-jwt";
 import { ServerError } from "../errors";
 import { ManifestSchema, manifestSchema } from "../manifest";
@@ -9,6 +5,9 @@ import { hexToDigest } from "../user";
 import { getRegistryReference, parseRegistryReference } from "./references";
 
 const ACTIVE_UPLOAD_MAX_AGE_MS = 25 * 60 * 60 * 1000;
+const DELETE_BATCH_SIZE = 100;
+const FILTER_BYTE_SIZE = 2 * 1024 * 1024;
+const FILTER_HASH_COUNT = 7;
 export const DEFAULT_GC_MINIMUM_OBJECT_AGE_MS = 60 * 60 * 1000;
 
 export type GarbageCollectionMode = "unreferenced" | "untagged";
@@ -25,53 +24,69 @@ export type GarbageCollectionResult = {
   bytes: number;
 };
 
-// The garbage collector checks for dangling layers in the namespace. It's a lock free
-// GC, but on-conflict (when there is an ongoing manifest insertion, or an ongoing garbage collection),
-// the methods can throw errors.
-//
-// Summary:
-//          insertParent() {
-//              gcMark = getGCMark(); // get last gc mark
-//              mark = updateInsertMark(); // mark insertion
-//              defer cleanInsertMark(mark);
-//              checkEveryChildIsOK();
-//              gcMarkIsEqualAndNotOngoingGc(gcMark); // make sure not ongoing deletion mark after checking child is in db
-//              insertParent(); // insert parent in db
-//           }
-//
-//           gc() {
-//             insertionMark = getInsertionMark() // get last insertion mark
-//             mark = setGCMark() // marks deletion as gc
-//             defer { cleanGCMark(mark); } // clean up mark
-//             checkNotOngoingInsertMark(mark) // makes sure not ongoing updateInsertMark, and no new one
-//             deleteChildrenWithoutParent(); // go ahead and clean children
-//           }
-//
-// This makes it so: after every layer is OK we can proceed and insert the manifest, as there is no ongoing GC
-// In the GC code, if there is an insertion on-going, there is an error.
-export class GarbageCollector {
-  private registry: R2Bucket;
+class ConservativeBloomFilter {
+  private bits = new Uint8Array(FILTER_BYTE_SIZE);
+  private bitCount = this.bits.length * 8;
 
-  constructor(
-    registry: R2Bucket,
-    private minimumObjectAgeMs = DEFAULT_GC_MINIMUM_OBJECT_AGE_MS,
-  ) {
-    this.registry = registry;
+  private hashes(value: string): [number, number] {
+    let first = 0x811c9dc5;
+    let second = 0x9e3779b9;
+    for (let index = 0; index < value.length; index++) {
+      const code = value.charCodeAt(index);
+      first = Math.imul(first ^ code, 0x01000193) >>> 0;
+      second = Math.imul(second ^ code, 0x85ebca6b) >>> 0;
+    }
+    return [first, second | 1];
   }
 
+  add(value: string): boolean {
+    const [first, second] = this.hashes(value);
+    let changed = false;
+    for (let index = 0; index < FILTER_HASH_COUNT; index++) {
+      const bit = ((first + Math.imul(index, second)) >>> 0) % this.bitCount;
+      const byte = bit >>> 3;
+      const mask = 1 << (bit & 7);
+      if ((this.bits[byte] & mask) === 0) {
+        this.bits[byte] |= mask;
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  has(value: string): boolean {
+    const [first, second] = this.hashes(value);
+    for (let index = 0; index < FILTER_HASH_COUNT; index++) {
+      const bit = ((first + Math.imul(index, second)) >>> 0) % this.bitCount;
+      const byte = bit >>> 3;
+      const mask = 1 << (bit & 7);
+      if ((this.bits[byte] & mask) === 0) return false;
+    }
+    return true;
+  }
+}
+
+export class GarbageCollector {
+  constructor(
+    private registry: R2Bucket,
+    private minimumObjectAgeMs = DEFAULT_GC_MINIMUM_OBJECT_AGE_MS,
+  ) {}
+
   async markForGarbageCollection(namespace: string): Promise<string> {
-    const etag = crypto.randomUUID();
-    const deletion = await this.registry.put(`${namespace}/gc/marker`, etag);
-    if (deletion === null) throw new Error("unreachable");
-    // set last_update so inserters are able to invalidate
+    const token = crypto.randomUUID();
+    const marker = await this.registry.put(`${namespace}/gc/marker`, token, {
+      onlyIf: { etagDoesNotMatch: "*" },
+    });
+    if (marker === null) {
+      throw new ServerError("garbage collection is already running", 409);
+    }
     await this.registry.put(`${namespace}/gc/last_update`, null, {
       customMetadata: { timestamp: `${Date.now()}-${crypto.randomUUID()}` },
     });
-    return etag;
+    return token;
   }
 
   async cleanupGarbageCollectionMark(namespace: string) {
-    // set last_update so inserters can confirm that a GC didnt happen while they were confirming data
     await this.registry.put(`${namespace}/gc/last_update`, null, {
       customMetadata: { timestamp: `${Date.now()}-${crypto.randomUUID()}` },
     });
@@ -80,64 +95,35 @@ export class GarbageCollector {
 
   async getGCMarker(namespace: string): Promise<string> {
     const object = await this.registry.head(`${namespace}/gc/last_update`);
-    if (object === null) {
-      return "";
-    }
-
-    if (object.customMetadata === undefined) {
-      return "";
-    }
-
+    if (object === null || object.customMetadata === undefined) return "";
     return object.customMetadata["timestamp"] ?? "mark";
   }
 
   async checkCanInsertData(namespace: string, mark: string): Promise<boolean> {
-    const gcMarker = await this.registry.head(`${namespace}/gc/marker`);
-    if (gcMarker !== null) {
-      return false;
-    }
-
-    const newMarker = await this.getGCMarker(namespace);
-    // There's been a new garbage collection since we started the check for insertion
-    if (newMarker !== mark) return false;
-
-    return true;
+    if ((await this.registry.head(`${namespace}/gc/marker`)) !== null) return false;
+    return (await this.getGCMarker(namespace)) === mark;
   }
 
-  // If successful, it inserted in R2 that its going
-  // to start inserting data that might conflight with GC.
   async markForInsertion(namespace: string): Promise<string> {
     const uid = crypto.randomUUID();
-    // mark that there is an on-going insertion
-    const deletion = await this.registry.put(`${namespace}/insertion/${uid}`, uid);
-    if (deletion === null) throw new Error("unreachable");
-    // set last_update so GC is able to invalidate
+    const insertion = await this.registry.put(`${namespace}/insertion/${uid}`, uid);
+    if (insertion === null) throw new Error("unreachable");
     await this.registry.put(`${namespace}/insertion/last_update`, null, {
       customMetadata: { timestamp: `${Date.now()}-${crypto.randomUUID()}` },
     });
-
     return uid;
   }
 
   async cleanInsertion(namespace: string, tag: string) {
-    // update again to invalidate GC and the insertion is safe
     await this.registry.put(`${namespace}/insertion/last_update`, null, {
       customMetadata: { timestamp: `${Date.now()}-${crypto.randomUUID()}` },
     });
-
     await this.registry.delete(`${namespace}/insertion/${tag}`);
   }
 
   async getInsertionMark(namespace: string): Promise<string> {
     const object = await this.registry.head(`${namespace}/insertion/last_update`);
-    if (object === null) {
-      return "";
-    }
-
-    if (object.customMetadata === undefined) {
-      return "";
-    }
-
+    if (object === null || object.customMetadata === undefined) return "";
     return object.customMetadata["timestamp"] ?? "mark";
   }
 
@@ -145,184 +131,159 @@ export class GarbageCollector {
     const objects = await this.registry.list({ prefix: `${namespace}/insertion` });
     for (const object of objects.objects) {
       if (object.key.endsWith("/last_update")) continue;
-      if (object.uploaded.getTime() + 1000 * 60 <= Date.now()) {
+      if (object.uploaded.getTime() + 60_000 <= Date.now()) {
         await this.registry.delete(object.key);
       } else {
         return false;
       }
     }
-
-    // call again to clean more
     if (objects.truncated) return false;
+    return (await this.getInsertionMark(namespace)) === mark;
+  }
 
-    const newMark = await this.getInsertionMark(namespace);
-    if (newMark !== mark) {
-      return false;
+  async withGarbageCollectionLock<T>(namespace: string, callback: () => Promise<T>): Promise<T> {
+    await this.markForGarbageCollection(namespace);
+    try {
+      const insertionMark = await this.getInsertionMark(namespace);
+      if (!(await this.checkIfGCCanContinue(namespace, insertionMark))) {
+        throw new ServerError("manifest insertion is in progress", 409);
+      }
+      return await callback();
+    } finally {
+      await this.cleanupGarbageCollectionMark(namespace);
     }
-
-    return true;
   }
 
   private async list(prefix: string, callback: (object: R2Object) => Promise<boolean>): Promise<boolean> {
-    const listed = await this.registry.list({ prefix });
-    for (const object of listed.objects) {
-      if ((await callback(object)) === false) {
-        return false;
+    let cursor: string | undefined;
+    do {
+      const page = await this.registry.list({
+        prefix,
+        cursor,
+        include: ["customMetadata"],
+      } as unknown as R2ListOptions);
+      for (const object of page.objects) {
+        if (!(await callback(object))) return false;
       }
-    }
-
-    let truncated = listed.truncated;
-    let cursor = listed.truncated ? listed.cursor : undefined;
-
-    while (truncated) {
-      const next = await this.registry.list({ prefix, cursor });
-      for (const object of next.objects) {
-        if ((await callback(object)) === false) {
-          return false;
-        }
-      }
-      cursor = next.truncated ? next.cursor : undefined;
-      truncated = next.truncated;
-    }
+      cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor);
     return true;
+  }
+
+  private manifestDigest(object: R2Object): string {
+    if (!object.checksums.sha256) {
+      throw new ServerError("manifest is missing its sha256 checksum");
+    }
+    return hexToDigest(object.checksums.sha256);
+  }
+
+  private async loadManifest(key: string): Promise<ManifestSchema> {
+    const object = await this.registry.get(key);
+    if (!object) throw new ServerError(`manifest ${key} disappeared during garbage collection`);
+    const parsed = manifestSchema.safeParse(await object.json());
+    if (!parsed.success) throw new ServerError(`manifest ${key} is invalid`);
+    return parsed.data;
+  }
+
+  private isRecent(object: R2Object): boolean {
+    return object.uploaded.getTime() + this.minimumObjectAgeMs > Date.now();
   }
 
   async collect(options: GCOptions): Promise<GarbageCollectionResult> {
     if (options.dryRun) return this.collectInner(options);
-
-    await this.markForGarbageCollection(options.name);
-    try {
-      return await this.collectInner(options);
-    } finally {
-      // if this fails, user can always call a custom endpoint to clean it up
-      await this.cleanupGarbageCollectionMark(options.name);
-    }
+    return this.withGarbageCollectionLock(options.name, () => this.collectInner(options));
   }
 
   private async collectInner(options: GCOptions): Promise<GarbageCollectionResult> {
-    const mark = await this.getInsertionMark(options.name);
+    const insertionMark = await this.getInsertionMark(options.name);
     const excludedReferences = new Set(options.excludedReferences ?? []);
-    const manifestKeysByDigest = new Map<string, Set<string>>();
-    const manifestDataByDigest = new Map<string, ManifestSchema>();
-    const manifestObjectsByKey = new Map<string, R2Object>();
+    const liveManifests = new ConservativeBloomFilter();
     let objectCount = 0;
     let bytes = 0;
 
-    await this.list(`${options.name}/manifests/`, async (manifestObject) => {
-      if (!manifestObject.checksums.sha256) {
-        throw new ServerError("manifest is missing its sha256 checksum");
+    await this.list(`${options.name}/manifests/`, async (object) => {
+      const digest = this.manifestDigest(object);
+      const reference = object.key.split("/").pop();
+      if (!reference) return true;
+      const digestReference = reference.startsWith("sha256:");
+      const excludedAndOld = excludedReferences.has(reference) && !this.isRecent(object);
+      if (options.mode === "unreferenced" || (!digestReference && !excludedAndOld) || this.isRecent(object)) {
+        liveManifests.add(digest);
       }
-      const digest = hexToDigest(manifestObject.checksums.sha256);
-      const keys = manifestKeysByDigest.get(digest) ?? new Set<string>();
-      keys.add(manifestObject.key);
-      manifestKeysByDigest.set(digest, keys);
-      manifestObjectsByKey.set(manifestObject.key, manifestObject);
+      if (!digestReference && !excludedAndOld) {
+        const canonical = await this.registry.head(`${options.name}/manifests/${digest}`);
+        if (!canonical) throw new ServerError(`canonical manifest ${digest} is missing`);
+      }
       return true;
     });
 
-    const loadManifest = async (digest: string): Promise<ManifestSchema> => {
-      const cached = manifestDataByDigest.get(digest);
-      if (cached) return cached;
+    let liveSetChanged: boolean;
+    do {
+      liveSetChanged = false;
+      await this.list(`${options.name}/manifests/sha256:`, async (object) => {
+        const digest = this.manifestDigest(object);
+        const manifest = await this.loadManifest(object.key);
+        if (manifest.schemaVersion !== 2) return true;
 
-      const key = manifestKeysByDigest.get(digest)?.values().next().value;
-      if (!key) {
-        throw new ServerError(`referenced manifest ${digest} is missing`);
-      }
-      const object = await this.registry.get(key);
-      if (!object) {
-        throw new ServerError(`manifest ${digest} disappeared during garbage collection`);
-      }
-      const parsed = manifestSchema.safeParse(await object.json());
-      if (!parsed.success) {
-        throw new ServerError(`manifest ${digest} is invalid`);
-      }
-      manifestDataByDigest.set(digest, parsed.data);
-      return parsed.data;
-    };
-
-    const relatedManifests = new Map<string, Set<string>>();
-    const addManifestRelationship = (source: string, destination: string) => {
-      const relationships = relatedManifests.get(source) ?? new Set<string>();
-      relationships.add(destination);
-      relatedManifests.set(source, relationships);
-    };
-
-    for (const digest of manifestKeysByDigest.keys()) {
-      const manifest = await loadManifest(digest);
-      if (manifest.schemaVersion !== 2) continue;
-      if ("manifests" in manifest) {
-        manifest.manifests.forEach((child) => addManifestRelationship(digest, child.digest));
-      } else if (manifest.subject && manifestKeysByDigest.has(manifest.subject.digest)) {
-        addManifestRelationship(digest, manifest.subject.digest);
-        addManifestRelationship(manifest.subject.digest, digest);
-      }
-    }
-
-    const liveManifests = new Set<string>();
-    const pendingManifests: string[] = [];
-    for (const [digest, keys] of manifestKeysByDigest) {
-      const tagged = [...keys].some((key) => {
-        const reference = key.split("/").pop();
-        return reference && !reference.startsWith("sha256:") && !excludedReferences.has(reference);
+        if ("manifests" in manifest) {
+          if (liveManifests.has(digest)) {
+            for (const child of manifest.manifests) {
+              liveSetChanged = liveManifests.add(child.digest) || liveSetChanged;
+            }
+          }
+        } else if (manifest.subject) {
+          if (liveManifests.has(digest)) {
+            liveSetChanged = liveManifests.add(manifest.subject.digest) || liveSetChanged;
+          }
+          if (liveManifests.has(manifest.subject.digest)) {
+            liveSetChanged = liveManifests.add(digest) || liveSetChanged;
+          }
+        }
+        return true;
       });
-      const recentlyUploaded = [...keys].some((key) => {
-        const reference = key.split("/").pop();
-        if (reference && excludedReferences.has(reference)) return false;
-        const object = manifestObjectsByKey.get(key);
-        return object && object.uploaded.getTime() + this.minimumObjectAgeMs > Date.now();
-      });
-      if (options.mode === "unreferenced" || tagged || recentlyUploaded) {
-        liveManifests.add(digest);
-        pendingManifests.push(digest);
-      }
-    }
+    } while (liveSetChanged);
 
-    while (pendingManifests.length > 0) {
-      const digest = pendingManifests.pop()!;
-      for (const relatedDigest of relatedManifests.get(digest) ?? []) {
-        if (liveManifests.has(relatedDigest)) continue;
-        liveManifests.add(relatedDigest);
-        pendingManifests.push(relatedDigest);
+    let manifestKeys: string[] = [];
+    const flushManifestKeys = async () => {
+      if (manifestKeys.length === 0) return;
+      if (!options.dryRun) {
+        if (!(await this.checkIfGCCanContinue(options.name, insertionMark))) {
+          throw new ServerError("manifest insertion is in progress", 409);
+        }
+        await this.registry.delete(manifestKeys);
       }
-    }
+      manifestKeys = [];
+    };
 
     if (options.mode === "untagged") {
-      const untaggedManifestKeys = new Set<string>();
-      for (const [digest, keys] of manifestKeysByDigest) {
-        keys.forEach((key) => {
-          const reference = key.split("/").pop();
-          if (reference && excludedReferences.has(reference)) untaggedManifestKeys.add(key);
-        });
-        if (liveManifests.has(digest)) continue;
-        keys.forEach((key) => untaggedManifestKeys.add(key));
-      }
-      untaggedManifestKeys.forEach((key) => {
-        const object = manifestObjectsByKey.get(key);
-        if (!object) return;
+      await this.list(`${options.name}/manifests/`, async (object) => {
+        const digest = this.manifestDigest(object);
+        const reference = object.key.split("/").pop();
+        if (!reference) return true;
+        const deleteExcludedReference = excludedReferences.has(reference) && !this.isRecent(object);
+        if (!deleteExcludedReference && liveManifests.has(digest)) return true;
         objectCount++;
         bytes += object.size;
+        manifestKeys.push(object.key);
+        if (manifestKeys.length >= DELETE_BATCH_SIZE) await flushManifestKeys();
+        return true;
       });
-      if (untaggedManifestKeys.size > 0 && !options.dryRun) {
-        const keys = [...untaggedManifestKeys];
-        for (let index = 0; index < keys.length; index += 1000) {
-          if (!(await this.checkIfGCCanContinue(options.name, mark))) {
-            throw new ServerError("there is a manifest insertion going, the garbage collection shall stop");
-          }
-          await this.registry.delete(keys.slice(index, index + 1000));
-        }
-      }
+      await flushManifestKeys();
     }
 
-    const referencedBlobs = new Set<string>();
-    for (const digest of liveManifests) {
-      const manifest = await loadManifest(digest);
+    const referencedBlobs = new ConservativeBloomFilter();
+    await this.list(`${options.name}/manifests/sha256:`, async (object) => {
+      const digest = this.manifestDigest(object);
+      if (!liveManifests.has(digest)) return true;
+      const manifest = await this.loadManifest(object.key);
       if (manifest.schemaVersion === 1) {
         manifest.fsLayers.forEach((layer) => referencedBlobs.add(layer.blobSum));
       } else if (!("manifests" in manifest)) {
         referencedBlobs.add(manifest.config.digest);
         manifest.layers.forEach((layer) => referencedBlobs.add(layer.digest));
       }
-    }
+      return true;
+    });
 
     await this.list(`${options.name}/uploads/`, async (uploadObject) => {
       if (uploadObject.uploaded.getTime() + ACTIVE_UPLOAD_MAX_AGE_MS < Date.now()) return true;
@@ -337,7 +298,7 @@ export class GarbageCollector {
       return true;
     });
 
-    const retainedReferences = new Set<string>();
+    const retainedReferences = new ConservativeBloomFilter();
     await this.list(`${options.name}/blobs/`, async (object) => {
       const hash = object.key.split("/").pop();
       if (hash && referencedBlobs.has(hash)) {
@@ -347,46 +308,44 @@ export class GarbageCollector {
       return true;
     });
 
-    let unreferencedKeys = new Set<string>();
-    const scheduledLegacyTargets = new Set<string>();
-    const deleteThreshold = 15;
-    const flushUnreferencedKeys = async () => {
-      if (unreferencedKeys.size === 0) return;
+    const scheduledLegacyTargets = new ConservativeBloomFilter();
+    let blobKeys: string[] = [];
+    const flushBlobKeys = async () => {
+      if (blobKeys.length === 0) return;
       if (!options.dryRun) {
-        if (!(await this.checkIfGCCanContinue(options.name, mark))) {
-          throw new ServerError("there is a manifest insertion going, the garbage collection shall stop");
+        if (!(await this.checkIfGCCanContinue(options.name, insertionMark))) {
+          throw new ServerError("manifest insertion is in progress", 409);
         }
-        await this.registry.delete([...unreferencedKeys]);
+        await this.registry.delete(blobKeys);
       }
-      unreferencedKeys = new Set<string>();
+      blobKeys = [];
     };
 
     await this.list(`${options.name}/blobs/`, async (object) => {
       const hash = object.key.split("/").pop();
-      if (hash && !referencedBlobs.has(hash) && object.uploaded.getTime() + this.minimumObjectAgeMs <= Date.now()) {
-        objectCount++;
-        bytes += object.size;
-        const reference = await getRegistryReference(this.registry, object);
-        if (
-          reference &&
-          parseRegistryReference(reference) &&
-          !retainedReferences.has(reference) &&
-          !scheduledLegacyTargets.has(reference)
-        ) {
-          scheduledLegacyTargets.add(reference);
-          unreferencedKeys.add(reference);
-          const target = await this.registry.head(reference);
-          if (target) {
-            objectCount++;
-            bytes += target.size;
-          }
+      if (!hash || referencedBlobs.has(hash) || this.isRecent(object)) return true;
+
+      objectCount++;
+      bytes += object.size;
+      const reference = await getRegistryReference(this.registry, object);
+      if (
+        reference &&
+        parseRegistryReference(reference) &&
+        !retainedReferences.has(reference) &&
+        scheduledLegacyTargets.add(reference)
+      ) {
+        blobKeys.push(reference);
+        const target = await this.registry.head(reference);
+        if (target) {
+          objectCount++;
+          bytes += target.size;
         }
-        unreferencedKeys.add(object.key);
-        if (unreferencedKeys.size > deleteThreshold) await flushUnreferencedKeys();
       }
+      blobKeys.push(object.key);
+      if (blobKeys.length >= DELETE_BATCH_SIZE) await flushBlobKeys();
       return true;
     });
-    await flushUnreferencedKeys();
+    await flushBlobKeys();
 
     return { success: true, objectCount, bytes };
   }

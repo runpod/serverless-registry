@@ -179,8 +179,12 @@ export class RegistryTokens implements Authenticator {
 
       // PUSH methods
       case "POST":
-        // garbage collection is a destructive operation, it requires the "delete" capability
-        if (RegistryTokens.checkIfGarbageCollectionPath(request)) {
+        if (RegistryTokens.checkIfMaintenancePath(request)) {
+          if (!payload.capabilities.includes("pull") || !payload.capabilities.includes("delete")) {
+            console.warn(`verifyToken: failed jwt verification: missing maintenance capability in ${request.url}`);
+            return { verified: false, payload: null };
+          }
+        } else if (RegistryTokens.checkIfGarbageCollectionPath(request)) {
           if (!payload.capabilities.includes("delete")) {
             console.warn(
               `verifyToken: failed jwt verification: missing "delete" capability for ${request.method} HTTP method in ${request.url}`,

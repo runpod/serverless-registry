@@ -5,11 +5,13 @@ import { GarbageCollectionMode, GarbageCollectionResult } from "./garbage-collec
 import {
   CheckLayerResponse,
   CheckManifestResponse,
+  DeleteManifestTagResponse,
   DirectUploadInfo,
   FinishedUploadObject,
   GetLayerResponse,
   GetManifestResponse,
   ListRepositoriesResponse,
+  ManifestTagClaimResponse,
   PutManifestResponse,
   Registry,
   RegistryConfiguration,
@@ -456,6 +458,27 @@ export class RegistryHTTPClient implements Registry {
     _readableStream: ReadableStream<any>,
     _contentType: string,
   ): Promise<PutManifestResponse | RegistryError> {
+    throw new Error("unimplemented");
+  }
+
+  claimManifestTag(
+    _namespace: string,
+    _reference: string,
+    _expectedDigest: string,
+  ): Promise<ManifestTagClaimResponse> {
+    throw new Error("unimplemented");
+  }
+
+  releaseManifestTagClaim(_namespace: string, _reference: string, _token: string): Promise<boolean> {
+    throw new Error("unimplemented");
+  }
+
+  deleteManifestTag(
+    _namespace: string,
+    _reference: string,
+    _expectedDigest?: string,
+    _claimToken?: string,
+  ): Promise<DeleteManifestTagResponse> {
     throw new Error("unimplemented");
   }
 
