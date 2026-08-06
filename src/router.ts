@@ -174,6 +174,13 @@ v2Router.delete("/:name+/manifests/:reference", async (req, env: Env) => {
   if (manifest === null) {
     return new Response(JSON.stringify(ManifestUnknownError(reference)), { status: 404, headers: jsonHeaders() });
   }
+  const claims = await env.REGISTRY.list({ prefix: `${name}/deletion-claims/`, limit: 1 });
+  if (claims.objects.length > 0) {
+    return new Response(JSON.stringify({ error: "manifest tag deletion is in progress" }), {
+      status: 409,
+      headers: jsonHeaders(),
+    });
+  }
 
   const limitInt = parseInt(limit?.toString() ?? "1000", 10);
   const tags = await env.REGISTRY.list({

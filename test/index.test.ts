@@ -342,6 +342,9 @@ describe("v2 manifests", () => {
     const claimedHead = await fetch(createRequest("HEAD", `/v2/${name}/manifests/build`, null));
     expect(claimedHead.status).toBe(423);
 
+    const digestDelete = await fetch(createRequest("DELETE", `/v2/${name}/manifests/${sha256}`, null));
+    expect(digestDelete.status).toBe(409);
+
     const replacement = JSON.stringify({ ...manifest, annotations: { version: "replacement" } });
     const claimedPut = await fetch(
       createRequest("PUT", `/v2/${name}/manifests/build`, new Blob([replacement]).stream(), {

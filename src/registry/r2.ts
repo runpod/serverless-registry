@@ -567,7 +567,13 @@ export class R2Registry implements Registry {
       if (claimToken && !claim) return { deleted: false, reason: "claim_mismatch" };
 
       const object = await this.env.REGISTRY.head(`${name}/manifests/${reference}`);
-      if (!object) return { deleted: false, reason: "not_found" };
+      if (!object) {
+        if (claim) {
+          await this.env.REGISTRY.delete(claim.key);
+          return { deleted: true };
+        }
+        return { deleted: false, reason: "not_found" };
+      }
       if (!object.checksums.sha256) {
         throw new ServerError("manifest is missing its sha256 checksum");
       }
