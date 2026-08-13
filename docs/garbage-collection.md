@@ -84,8 +84,7 @@ that we are about to create a manifest and that we are inserting data.
 If the garbage collector starts and sees that key, it will fail. At the end of the insertion, the insertion mark
 gets updated.
 
-The same goes for the garbage collector, when it starts it creates a mark, and when it finishes it updates the
-mark.
+The garbage collector acquires a 15-minute lease and renews it before each deletion batch. Lease updates are conditional on the current object ETag, so a stale process cannot renew or release a newer collector's lease. Expired leases can be claimed by a later run.
 
 Let's state some scenarios:
 
