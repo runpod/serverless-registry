@@ -9,7 +9,7 @@ import { RegistryHTTPClient } from "../src/registry/http";
 import { encode } from "@cfworker/base64url";
 import { ManifestSchema } from "../src/manifest";
 import { limit } from "../src/chunk";
-import { encodeState } from "../src/registry/r2";
+import { DELETION_CLAIM_MAX_AGE_MS, encodeState } from "../src/registry/r2";
 import worker from "../index";
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
 
@@ -294,11 +294,7 @@ describe("v2 manifests", () => {
   test("tag deletion requires the expected digest", async () => {
     const name = "conditional-tag-delete";
     const manifest = await generateManifest(name);
-    const { sha256: oldDigest } = await createManifest(
-      name,
-      { ...manifest, annotations: { version: "old" } },
-      "build",
-    );
+    const { sha256: oldDigest } = await createManifest(name, { ...manifest, annotations: { version: "old" } }, "build");
     const { sha256: currentDigest } = await createManifest(
       name,
       { ...manifest, annotations: { version: "current" } },
@@ -360,6 +356,44 @@ describe("v2 manifests", () => {
       }),
     );
     expect(deleteResponse.status).toBe(202);
+  });
+
+  test("expired deletion claims do not block digest deletion", async () => {
+    const name = "expired-tag-claim";
+    const manifest = await generateManifest(name);
+    const { sha256 } = await createManifest(name, manifest, "build");
+    const bindings = env as Env;
+    const claimKey = `${name}/deletion-claims/build`;
+    await bindings.REGISTRY.put(claimKey, "expired", {
+      customMetadata: {
+        token: "expired",
+        digest: sha256,
+        expiresAt: (Date.now() - DELETION_CLAIM_MAX_AGE_MS).toString(),
+      },
+    });
+
+    const response = await fetch(createRequest("DELETE", `/v2/${name}/manifests/${sha256}`, null));
+
+    expect(response.status).toBe(202);
+    expect(await bindings.REGISTRY.head(claimKey)).toBeNull();
+  });
+
+  test("active deletion claims still block digest deletion", async () => {
+    const name = "active-tag-claim";
+    const manifest = await generateManifest(name);
+    const { sha256 } = await createManifest(name, manifest, "build");
+    const bindings = env as Env;
+    await bindings.REGISTRY.put(`${name}/deletion-claims/build`, "active", {
+      customMetadata: {
+        token: "active",
+        digest: sha256,
+        expiresAt: (Date.now() + DELETION_CLAIM_MAX_AGE_MS).toString(),
+      },
+    });
+
+    const response = await fetch(createRequest("DELETE", `/v2/${name}/manifests/${sha256}`, null));
+
+    expect(response.status).toBe(409);
   });
 
   test("untagged garbage collection removes digest manifests after tag deletion", async () => {

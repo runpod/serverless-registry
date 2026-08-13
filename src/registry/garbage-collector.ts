@@ -8,6 +8,7 @@ const ACTIVE_UPLOAD_MAX_AGE_MS = 25 * 60 * 60 * 1000;
 const DELETE_BATCH_SIZE = 100;
 const FILTER_BYTE_SIZE = 2 * 1024 * 1024;
 const FILTER_HASH_COUNT = 7;
+const GC_LEASE_DURATION_MS = 15 * 60 * 1000;
 export const DEFAULT_GC_MINIMUM_OBJECT_AGE_MS = 60 * 60 * 1000;
 
 export type GarbageCollectionMode = "unreferenced" | "untagged";
@@ -22,6 +23,11 @@ export type GarbageCollectionResult = {
   success: boolean;
   objectCount: number;
   bytes: number;
+};
+
+type GarbageCollectionLease = {
+  token: string;
+  etag: string;
 };
 
 class ConservativeBloomFilter {
@@ -72,25 +78,71 @@ export class GarbageCollector {
     private minimumObjectAgeMs = DEFAULT_GC_MINIMUM_OBJECT_AGE_MS,
   ) {}
 
-  async markForGarbageCollection(namespace: string): Promise<string> {
+  private gcMarkerKey(namespace: string): string {
+    return `${namespace}/gc/marker`;
+  }
+
+  private gcLeaseMetadata(token: string, expiresAt: number): Record<string, string> {
+    return { token, expiresAt: expiresAt.toString() };
+  }
+
+  private gcLeaseExpiresAt(marker: R2Object): number {
+    const configured = Number(marker.customMetadata?.expiresAt);
+    return Number.isFinite(configured) ? configured : marker.uploaded.getTime() + GC_LEASE_DURATION_MS;
+  }
+
+  private gcLeaseIsActive(marker: R2Object): boolean {
+    return this.gcLeaseExpiresAt(marker) > Date.now();
+  }
+
+  async markForGarbageCollection(namespace: string): Promise<GarbageCollectionLease> {
     const token = crypto.randomUUID();
-    const marker = await this.registry.put(`${namespace}/gc/marker`, token, {
+    const key = this.gcMarkerKey(namespace);
+    const options = {
+      customMetadata: this.gcLeaseMetadata(token, Date.now() + GC_LEASE_DURATION_MS),
+    };
+    let marker = await this.registry.put(key, token, {
+      ...options,
       onlyIf: { etagDoesNotMatch: "*" },
     });
     if (marker === null) {
-      throw new ServerError("garbage collection is already running", 409);
+      const existing = await this.registry.head(key);
+      if (!existing || this.gcLeaseIsActive(existing)) {
+        throw new ServerError("garbage collection is already running", 409);
+      }
+      marker = await this.registry.put(key, token, {
+        ...options,
+        onlyIf: { etagMatches: existing.etag },
+      });
+      if (marker === null) {
+        throw new ServerError("garbage collection is already running", 409);
+      }
     }
     await this.registry.put(`${namespace}/gc/last_update`, null, {
       customMetadata: { timestamp: `${Date.now()}-${crypto.randomUUID()}` },
     });
-    return token;
+    return { token, etag: marker.etag };
   }
 
-  async cleanupGarbageCollectionMark(namespace: string) {
+  private async renewGarbageCollectionLease(namespace: string, lease: GarbageCollectionLease): Promise<void> {
+    const marker = await this.registry.put(this.gcMarkerKey(namespace), lease.token, {
+      customMetadata: this.gcLeaseMetadata(lease.token, Date.now() + GC_LEASE_DURATION_MS),
+      onlyIf: { etagMatches: lease.etag },
+    });
+    if (marker === null) {
+      throw new ServerError("garbage collection lease was lost", 409);
+    }
+    lease.etag = marker.etag;
+  }
+
+  async cleanupGarbageCollectionMark(namespace: string, lease: GarbageCollectionLease): Promise<void> {
     await this.registry.put(`${namespace}/gc/last_update`, null, {
       customMetadata: { timestamp: `${Date.now()}-${crypto.randomUUID()}` },
     });
-    await this.registry.delete(`${namespace}/gc/marker`);
+    await this.registry.put(this.gcMarkerKey(namespace), "released", {
+      customMetadata: this.gcLeaseMetadata(`released-${crypto.randomUUID()}`, 0),
+      onlyIf: { etagMatches: lease.etag },
+    });
   }
 
   async getGCMarker(namespace: string): Promise<string> {
@@ -100,7 +152,8 @@ export class GarbageCollector {
   }
 
   async checkCanInsertData(namespace: string, mark: string): Promise<boolean> {
-    if ((await this.registry.head(`${namespace}/gc/marker`)) !== null) return false;
+    const marker = await this.registry.head(this.gcMarkerKey(namespace));
+    if (marker && this.gcLeaseIsActive(marker)) return false;
     return (await this.getGCMarker(namespace)) === mark;
   }
 
@@ -141,16 +194,19 @@ export class GarbageCollector {
     return (await this.getInsertionMark(namespace)) === mark;
   }
 
-  async withGarbageCollectionLock<T>(namespace: string, callback: () => Promise<T>): Promise<T> {
-    await this.markForGarbageCollection(namespace);
+  async withGarbageCollectionLock<T>(
+    namespace: string,
+    callback: (lease: GarbageCollectionLease) => Promise<T>,
+  ): Promise<T> {
+    const lease = await this.markForGarbageCollection(namespace);
     try {
       const insertionMark = await this.getInsertionMark(namespace);
       if (!(await this.checkIfGCCanContinue(namespace, insertionMark))) {
         throw new ServerError("manifest insertion is in progress", 409);
       }
-      return await callback();
+      return await callback(lease);
     } finally {
-      await this.cleanupGarbageCollectionMark(namespace);
+      await this.cleanupGarbageCollectionMark(namespace, lease);
     }
   }
 
@@ -191,10 +247,10 @@ export class GarbageCollector {
 
   async collect(options: GCOptions): Promise<GarbageCollectionResult> {
     if (options.dryRun) return this.collectInner(options);
-    return this.withGarbageCollectionLock(options.name, () => this.collectInner(options));
+    return this.withGarbageCollectionLock(options.name, (lease) => this.collectInner(options, lease));
   }
 
-  private async collectInner(options: GCOptions): Promise<GarbageCollectionResult> {
+  private async collectInner(options: GCOptions, lease?: GarbageCollectionLease): Promise<GarbageCollectionResult> {
     const insertionMark = await this.getInsertionMark(options.name);
     const excludedReferences = new Set(options.excludedReferences ?? []);
     const liveManifests = new ConservativeBloomFilter();
@@ -247,6 +303,8 @@ export class GarbageCollector {
     const flushManifestKeys = async () => {
       if (manifestKeys.length === 0) return;
       if (!options.dryRun) {
+        if (!lease) throw new ServerError("garbage collection lease is missing", 409);
+        await this.renewGarbageCollectionLease(options.name, lease);
         if (!(await this.checkIfGCCanContinue(options.name, insertionMark))) {
           throw new ServerError("manifest insertion is in progress", 409);
         }
@@ -313,6 +371,8 @@ export class GarbageCollector {
     const flushBlobKeys = async () => {
       if (blobKeys.length === 0) return;
       if (!options.dryRun) {
+        if (!lease) throw new ServerError("garbage collection lease is missing", 409);
+        await this.renewGarbageCollectionLease(options.name, lease);
         if (!(await this.checkIfGCCanContinue(options.name, insertionMark))) {
           throw new ServerError("manifest insertion is in progress", 409);
         }

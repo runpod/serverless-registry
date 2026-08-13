@@ -42,7 +42,13 @@ const DIRECT_DEFAULT_PART_SIZE = 512 * 1024 * 1024; // 512MiB
 const DIRECT_PARTS_HEADER = "x-registry-direct-parts";
 const DIRECT_OBJECT_POLL_ATTEMPTS = 6;
 const DIRECT_OBJECT_INITIAL_DELAY_MS = 200;
-const DELETION_CLAIM_MAX_AGE_MS = 15 * 60 * 1000;
+export const DELETION_CLAIM_MAX_AGE_MS = 15 * 60 * 1000;
+
+export function deletionClaimIsActive(claim: R2Object, now = Date.now()): boolean {
+  const configured = Number(claim.customMetadata?.expiresAt);
+  const expiresAt = Number.isFinite(configured) ? configured : claim.uploaded.getTime() + DELETION_CLAIM_MAX_AGE_MS;
+  return expiresAt > now;
+}
 
 async function resolveUuidPointerIfNeeded(
   env: Env,
@@ -338,7 +344,7 @@ export class R2Registry implements Registry {
 
   private async getDeletionClaim(name: string, reference: string): Promise<R2Object | null> {
     const claim = await this.env.REGISTRY.head(this.deletionClaimKey(name, reference));
-    if (!claim || claim.uploaded.getTime() + DELETION_CLAIM_MAX_AGE_MS <= Date.now()) return null;
+    if (!claim || !deletionClaimIsActive(claim)) return null;
     return claim;
   }
 
@@ -514,15 +520,11 @@ export class R2Registry implements Registry {
     }
   }
 
-  async claimManifestTag(
-    name: string,
-    reference: string,
-    expectedDigest: string,
-  ): Promise<ManifestTagClaimResponse> {
+  async claimManifestTag(name: string, reference: string, expectedDigest: string): Promise<ManifestTagClaimResponse> {
     return this.gc.withGarbageCollectionLock(name, async () => {
       const claimKey = this.deletionClaimKey(name, reference);
       const existingClaim = await this.env.REGISTRY.head(claimKey);
-      if (existingClaim && existingClaim.uploaded.getTime() + DELETION_CLAIM_MAX_AGE_MS > Date.now()) {
+      if (existingClaim && deletionClaimIsActive(existingClaim)) {
         return { claimed: false, reason: "already_claimed" };
       }
       if (existingClaim) await this.env.REGISTRY.delete(claimKey);
@@ -538,7 +540,11 @@ export class R2Registry implements Registry {
 
       const token = crypto.randomUUID();
       await this.env.REGISTRY.put(claimKey, token, {
-        customMetadata: { token, digest: expectedDigest },
+        customMetadata: {
+          token,
+          digest: expectedDigest,
+          expiresAt: (Date.now() + DELETION_CLAIM_MAX_AGE_MS).toString(),
+        },
       });
       return { claimed: true, token };
     });

@@ -19,6 +19,7 @@ import {
   registries,
 } from "./registry/registry";
 import { RegistryHTTPClient } from "./registry/http";
+import { deletionClaimIsActive } from "./registry/r2";
 
 const v2Router = Router({ base: "/v2/" });
 const TAG_REFERENCE_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/;
@@ -174,13 +175,27 @@ v2Router.delete("/:name+/manifests/:reference", async (req, env: Env) => {
   if (manifest === null) {
     return new Response(JSON.stringify(ManifestUnknownError(reference)), { status: 404, headers: jsonHeaders() });
   }
-  const claims = await env.REGISTRY.list({ prefix: `${name}/deletion-claims/`, limit: 1 });
-  if (claims.objects.length > 0) {
-    return new Response(JSON.stringify({ error: "manifest tag deletion is in progress" }), {
-      status: 409,
-      headers: jsonHeaders(),
-    });
-  }
+  let claimCursor: string | undefined;
+  do {
+    const claims = await env.REGISTRY.list({
+      prefix: `${name}/deletion-claims/`,
+      limit: 100,
+      cursor: claimCursor,
+      include: ["customMetadata"],
+    } as unknown as R2ListOptions);
+    const expiredClaims: string[] = [];
+    for (const claim of claims.objects) {
+      if (deletionClaimIsActive(claim)) {
+        return new Response(JSON.stringify({ error: "manifest tag deletion is in progress" }), {
+          status: 409,
+          headers: jsonHeaders(),
+        });
+      }
+      expiredClaims.push(claim.key);
+    }
+    if (expiredClaims.length > 0) await env.REGISTRY.delete(expiredClaims);
+    claimCursor = claims.truncated ? claims.cursor : undefined;
+  } while (claimCursor);
 
   const limitInt = parseInt(limit?.toString() ?? "1000", 10);
   const tags = await env.REGISTRY.list({
