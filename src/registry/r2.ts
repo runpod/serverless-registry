@@ -613,6 +613,16 @@ export class R2Registry implements Registry {
     shaWriter.close();
     const digest = await sha256.digest;
     const digestStr = hexToDigest(digest);
+
+    if (reference.startsWith("sha256:") && reference !== digestStr) {
+      return {
+        response: new ManifestError(
+          "DIGEST_INVALID",
+          `provided digest ${reference} does not match content digest ${digestStr}`,
+        ),
+      };
+    }
+
     const text = await blob.text();
     const manifestJSON = JSON.parse(text);
     const manifest = manifestSchema.parse(manifestJSON);
