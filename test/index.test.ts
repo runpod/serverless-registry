@@ -663,6 +663,30 @@ describe("tokens", async () => {
     expect(verified).toBeTruthy();
   });
 
+  test("auth payload without capabilities cannot GET registry base paths", async () => {
+    for (const url of ["https://registry.runpod.net/", "https://registry.com/v2/"]) {
+      const { verified } = RegistryTokens.verifyPayload(new Request(url), {
+        username: "test",
+        capabilities: [],
+        exp: Math.floor(Date.now() / 1000) + 60,
+        aud: url,
+      });
+      expect(verified).toBeFalsy();
+    }
+  });
+
+  test("auth payload push can GET the registry root on any host", async () => {
+    for (const url of ["https://registry.runpod.net/", "https://registry.example/?check=1"]) {
+      const { verified } = RegistryTokens.verifyPayload(new Request(url), {
+        username: "test",
+        capabilities: ["push"],
+        exp: Math.floor(Date.now() / 1000) + 60,
+        aud: url,
+      });
+      expect(verified).toBeTruthy();
+    }
+  });
+
   test("auth payload push on /v2/whatever with HEAD", async () => {
     const { verified } = RegistryTokens.verifyPayload(createRequest("HEAD", "/v2/whatever", null), {
       capabilities: ["push"],

@@ -74,8 +74,9 @@ export class RegistryTokens implements Authenticator {
     return token;
   }
 
-  static checkIfV2OnlyPath(request: Request): boolean {
-    return request.url.endsWith("/v2/");
+  static checkIfRegistryBasePath(request: Request): boolean {
+    const pathname = new URL(request.url).pathname;
+    return pathname === "/" || pathname === "/v2/";
   }
 
   static checkIfGarbageCollectionPath(request: Request): boolean {
@@ -143,18 +144,17 @@ export class RegistryTokens implements Authenticator {
         }
         break;
       // PULL method
-      case "GET":
-        if (RegistryTokens.checkIfV2OnlyPath(request)) {
-          return { verified: true, payload };
-        }
-
-        if (request.url == "https://registry.runpod.net/" || request.url == "https://registry.runpod.net") {
-          return { verified: true, payload };
-        }
-
-        if (RegistryTokens.checkIfV2OnlyPath(request) && payload.capabilities.length === 0) {
-          console.warn("verifyToken: failed jwt verification: missing any capabilities for GET request in /v2/");
+      case "GET": {
+        const isRegistryBasePath = RegistryTokens.checkIfRegistryBasePath(request);
+        if (isRegistryBasePath && payload.capabilities.length === 0) {
+          console.warn(
+            "verifyToken: failed jwt verification: missing any capabilities for GET request to registry base path",
+          );
           return { verified: false, payload: null };
+        }
+
+        if (isRegistryBasePath) {
+          return { verified: true, payload };
         }
 
         if (!payload.capabilities.includes("pull")) {
@@ -176,6 +176,7 @@ export class RegistryTokens implements Authenticator {
           return { verified: false, payload: null };
         }
         break;
+      }
 
       // PUSH methods
       case "POST":
