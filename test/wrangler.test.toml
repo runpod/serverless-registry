@@ -19,3 +19,4 @@ r2_buckets = [{ binding = "REGISTRY", bucket_name = "r2-image-registry-dev" }]
 [env.dev.vars]
 USERNAME = "hello"
 PASSWORD = "world"
+GC_MINIMUM_OBJECT_AGE_MS = "0"

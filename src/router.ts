@@ -19,11 +19,108 @@ import {
   registries,
 } from "./registry/registry";
 import { RegistryHTTPClient } from "./registry/http";
+import { deletionClaimIsActive } from "./registry/r2";
 
 const v2Router = Router({ base: "/v2/" });
+const TAG_REFERENCE_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/;
+const DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/;
 
 v2Router.get("/", async (_req, _env: Env) => {
   return new Response();
+});
+
+v2Router.get("/_maintenance/repositories", async (req, env: Env) => {
+  const requestedLimit = Number(req.query.limit ?? 100);
+  const limit = Number.isFinite(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 1000) : 100;
+  let cursor = req.query.cursor?.toString();
+  const repositories = new Set<string>();
+  let pages = 0;
+
+  do {
+    const page = await env.REGISTRY.list({
+      delimiter: "/",
+      limit: Math.max(1, limit - repositories.size),
+      cursor,
+    });
+    page.delimitedPrefixes.forEach((prefix) => repositories.add(prefix.replace(/\/$/, "")));
+    cursor = page.truncated ? page.cursor : undefined;
+    pages++;
+  } while (cursor && repositories.size < limit && pages < 50);
+
+  return new Response(
+    JSON.stringify({
+      repositories: [...repositories],
+      cursor,
+    }),
+    { headers: jsonHeaders() },
+  );
+});
+
+v2Router.get("/_maintenance/:name+/tags", async (req, env: Env) => {
+  const requestedLimit = Number(req.query.limit ?? 1000);
+  const limit = Number.isFinite(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 1000) : 1000;
+  const { name } = req.params;
+  const page = await env.REGISTRY.list({
+    prefix: `${name}/manifests/`,
+    limit,
+    cursor: req.query.cursor?.toString(),
+  });
+  const tags = page.objects.flatMap((object) => {
+    const reference = object.key.slice(`${name}/manifests/`.length);
+    if (!TAG_REFERENCE_PATTERN.test(reference) || !object.checksums.sha256) return [];
+    return [
+      {
+        reference,
+        digest: hexToDigest(object.checksums.sha256),
+        uploadedAt: object.uploaded.toISOString(),
+      },
+    ];
+  });
+
+  return new Response(
+    JSON.stringify({
+      tags,
+      cursor: page.truncated ? page.cursor : undefined,
+    }),
+    { headers: jsonHeaders() },
+  );
+});
+
+v2Router.post("/_maintenance/:name+/tags/:reference/claim", async (req, env: Env) => {
+  const { name, reference } = req.params;
+  if (!TAG_REFERENCE_PATTERN.test(reference)) {
+    return new Response(JSON.stringify({ error: "invalid tag reference" }), {
+      status: 400,
+      headers: jsonHeaders(),
+    });
+  }
+
+  const body = await req.json<{ digest?: unknown }>().catch(() => null);
+  if (!body || typeof body.digest !== "string" || !DIGEST_PATTERN.test(body.digest)) {
+    return new Response(JSON.stringify({ error: "invalid expected digest" }), {
+      status: 400,
+      headers: jsonHeaders(),
+    });
+  }
+
+  const result = await env.REGISTRY_CLIENT.claimManifestTag(name, reference, body.digest);
+  if (!result.claimed) {
+    const status = result.reason === "not_found" ? 404 : result.reason === "digest_mismatch" ? 412 : 409;
+    return new Response(JSON.stringify({ error: result.reason }), { status, headers: jsonHeaders() });
+  }
+  return new Response(JSON.stringify({ token: result.token }), { status: 201, headers: jsonHeaders() });
+});
+
+v2Router.delete("/_maintenance/:name+/tags/:reference/claim", async (req, env: Env) => {
+  const token = req.headers.get("X-Runpod-Deletion-Claim");
+  if (!token) {
+    return new Response(JSON.stringify({ error: "missing deletion claim" }), {
+      status: 400,
+      headers: jsonHeaders(),
+    });
+  }
+  const released = await env.REGISTRY_CLIENT.releaseManifestTagClaim(req.params.name, req.params.reference, token);
+  return new Response(null, { status: released ? 204 : 409 });
 });
 
 v2Router.get("/_catalog", async (req, env: Env) => {
@@ -50,25 +147,56 @@ v2Router.get("/_catalog", async (req, env: Env) => {
 });
 
 v2Router.delete("/:name+/manifests/:reference", async (req, env: Env) => {
-  // deleting a manifest works by retrieving the """main""" manifest that its key is a sha,
-  // and then going through every tag and removing it
-  //
-  // after removing every tag, it's safe to remove the main manifest.
-  //
-  // if the transaction ends in an inconsistent state, the client can call this endpoint again
-  // and we would try to delete everything again
-  //
-  // we limit 1k tag deletions per request. If more we will return an error so client retries.
-  //
-  // If somehow we need to remove by paginating, we accept a last query param
-
   const { last, limit } = req.query;
   const { name, reference } = req.params;
-  // Reference is ALWAYS a sha256
+
+  if (!reference.startsWith("sha256:")) {
+    const expectedDigest = req.headers.get("X-Runpod-Expected-Digest") ?? undefined;
+    if (expectedDigest && !DIGEST_PATTERN.test(expectedDigest)) {
+      return new Response(JSON.stringify({ error: "invalid expected digest" }), {
+        status: 400,
+        headers: jsonHeaders(),
+      });
+    }
+
+    const claimToken = req.headers.get("X-Runpod-Deletion-Claim") ?? undefined;
+    const result = await env.REGISTRY_CLIENT.deleteManifestTag(name, reference, expectedDigest, claimToken);
+    if (!result.deleted) {
+      const status = result.reason === "not_found" ? 404 : result.reason === "digest_mismatch" ? 412 : 409;
+      return new Response(JSON.stringify({ error: result.reason }), { status, headers: jsonHeaders() });
+    }
+    return new Response("", {
+      status: 202,
+      headers: { "Content-Length": "None" },
+    });
+  }
+
   const manifest = await env.REGISTRY.head(`${name}/manifests/${reference}`);
   if (manifest === null) {
     return new Response(JSON.stringify(ManifestUnknownError(reference)), { status: 404, headers: jsonHeaders() });
   }
+  let claimCursor: string | undefined;
+  do {
+    const claims = await env.REGISTRY.list({
+      prefix: `${name}/deletion-claims/`,
+      limit: 100,
+      cursor: claimCursor,
+      include: ["customMetadata"],
+    } as unknown as R2ListOptions);
+    const expiredClaims: string[] = [];
+    for (const claim of claims.objects) {
+      if (deletionClaimIsActive(claim)) {
+        return new Response(JSON.stringify({ error: "manifest tag deletion is in progress" }), {
+          status: 409,
+          headers: jsonHeaders(),
+        });
+      }
+      expiredClaims.push(claim.key);
+    }
+    if (expiredClaims.length > 0) await env.REGISTRY.delete(expiredClaims);
+    claimCursor = claims.truncated ? claims.cursor : undefined;
+  } while (claimCursor);
+
   const limitInt = parseInt(limit?.toString() ?? "1000", 10);
   const tags = await env.REGISTRY.list({
     prefix: `${name}/manifests`,
@@ -117,6 +245,8 @@ v2Router.head("/:name+/manifests/:reference", async (req, env: Env) => {
       },
     });
   }
+
+  if ("response" in res && res.response.status === 423) return res.response;
 
   let checkManifestResponse: CheckManifestResponse | null = null;
   const registryList = registries(env);
@@ -186,6 +316,8 @@ v2Router.get("/:name+/manifests/:reference", async (req, env: Env, context: Exec
       },
     });
   }
+
+  if ("response" in res && res.response.status === 423) return res.response;
 
   let getManifestResponse: GetManifestResponse | null = null;
   const registriesList = registries(env);
@@ -641,8 +773,32 @@ v2Router.post("/:name+/gc", async (req, env: Env) => {
   if (mode !== "unreferenced" && mode !== "untagged") {
     throw new ServerError("Mode must be either 'unreferenced' or 'untagged'", 400);
   }
-  const result = await env.REGISTRY_CLIENT.garbageCollection(name, mode);
-  return new Response(JSON.stringify({ success: result }));
+
+  const dryRun = req.query.dry_run === "true";
+  let excludedReferences: string[] | undefined;
+  if (dryRun) {
+    let payload: unknown;
+    try {
+      payload = await req.json();
+    } catch {
+      throw new ServerError("Dry-run garbage collection requires a JSON body", 400);
+    }
+    const references = (payload as { references?: unknown })?.references;
+    if (
+      !Array.isArray(references) ||
+      references.length > 100 ||
+      !references.every((reference) => typeof reference === "string" && TAG_REFERENCE_PATTERN.test(reference))
+    ) {
+      throw new ServerError("Dry-run garbage collection references are invalid", 400);
+    }
+    excludedReferences = [...new Set(references)];
+  }
+
+  const result = await env.REGISTRY_CLIENT.garbageCollection(name, mode, {
+    dryRun,
+    excludedReferences,
+  });
+  return new Response(JSON.stringify(result), { headers: jsonHeaders() });
 });
 
 export default v2Router;

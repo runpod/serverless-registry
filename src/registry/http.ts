@@ -1,15 +1,17 @@
 import { Env } from "../..";
 import { InternalError } from "../errors";
 import { errorString } from "../utils";
-import { GarbageCollectionMode } from "./garbage-collector";
+import { GarbageCollectionMode, GarbageCollectionResult } from "./garbage-collector";
 import {
   CheckLayerResponse,
   CheckManifestResponse,
+  DeleteManifestTagResponse,
   DirectUploadInfo,
   FinishedUploadObject,
   GetLayerResponse,
   GetManifestResponse,
   ListRepositoriesResponse,
+  ManifestTagClaimResponse,
   PutManifestResponse,
   Registry,
   RegistryConfiguration,
@@ -459,6 +461,27 @@ export class RegistryHTTPClient implements Registry {
     throw new Error("unimplemented");
   }
 
+  claimManifestTag(
+    _namespace: string,
+    _reference: string,
+    _expectedDigest: string,
+  ): Promise<ManifestTagClaimResponse> {
+    throw new Error("unimplemented");
+  }
+
+  releaseManifestTagClaim(_namespace: string, _reference: string, _token: string): Promise<boolean> {
+    throw new Error("unimplemented");
+  }
+
+  deleteManifestTag(
+    _namespace: string,
+    _reference: string,
+    _expectedDigest?: string,
+    _claimToken?: string,
+  ): Promise<DeleteManifestTagResponse> {
+    throw new Error("unimplemented");
+  }
+
   startUpload(_namespace: string): Promise<UploadObject | RegistryError> {
     throw new Error("unimplemented");
   }
@@ -502,7 +525,11 @@ export class RegistryHTTPClient implements Registry {
     throw new Error("unimplemented");
   }
 
-  garbageCollection(_namespace: string, _mode: GarbageCollectionMode): Promise<boolean> {
+  garbageCollection(
+    _namespace: string,
+    _mode: GarbageCollectionMode,
+    _options?: { dryRun?: boolean; excludedReferences?: string[] },
+  ): Promise<GarbageCollectionResult> {
     throw new Error("unimplemented");
   }
 }

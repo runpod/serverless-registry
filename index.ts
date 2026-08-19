@@ -29,6 +29,7 @@ export interface Env {
   R2_PRESIGN_BUCKET_NAME?: string;
   R2_PRESIGN_ACCOUNT_ID?: string;
   R2_PRESIGN_ENDPOINT?: string;
+  GC_MINIMUM_OBJECT_AGE_MS?: string;
 }
 
 const router = Router();

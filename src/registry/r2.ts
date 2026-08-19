@@ -17,12 +17,14 @@ import { BlobUnknownError, ManifestUnknownError } from "../v2-errors";
 import {
   CheckLayerResponse,
   CheckManifestResponse,
+  DeleteManifestTagResponse,
   DirectUploadPart,
   DirectUploadInfo,
   FinishedUploadObject,
   GetLayerResponse,
   GetManifestResponse,
   ListRepositoriesResponse,
+  ManifestTagClaimResponse,
   PutManifestResponse,
   Registry,
   RegistryError,
@@ -30,8 +32,9 @@ import {
   UploadObject,
   wrapError,
 } from "./registry";
-import { GarbageCollectionMode, GarbageCollector } from "./garbage-collector";
+import { DEFAULT_GC_MINIMUM_OBJECT_AGE_MS, GarbageCollectionMode, GarbageCollector } from "./garbage-collector";
 import { ManifestSchema, manifestSchema } from "../manifest";
+import { getRegistryReferenceFromMetadata, parseRegistryReference, SMALL_BLOB_POINTER_MAX_BYTES } from "./references";
 
 const DIRECT_SINGLE_PUT_LIMIT = 5 * 1024 * 1024 * 1024; // 5GiB
 const DIRECT_MIN_PART_SIZE = 5 * 1024 * 1024; // 5MiB
@@ -39,23 +42,12 @@ const DIRECT_DEFAULT_PART_SIZE = 512 * 1024 * 1024; // 512MiB
 const DIRECT_PARTS_HEADER = "x-registry-direct-parts";
 const DIRECT_OBJECT_POLL_ATTEMPTS = 6;
 const DIRECT_OBJECT_INITIAL_DELAY_MS = 200;
+export const DELETION_CLAIM_MAX_AGE_MS = 15 * 60 * 1000;
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const SMALL_BLOB_POINTER_MAX_BYTES = 64; // if it is <= this, we can safely sniff it
-const META_REFERENCE_KEYS = ["X-Serverless-Registry-Reference", "x-serverless-registry-reference"];
-
-function getCustomMetadataCaseInsensitive(
-  obj: { customMetadata?: Record<string, string> },
-  key: string,
-): string | undefined {
-  const md = obj.customMetadata;
-  if (!md) return undefined;
-  if (md[key] !== undefined) return md[key];
-  const lower = key.toLowerCase();
-  for (const [k, v] of Object.entries(md)) {
-    if (k.toLowerCase() === lower) return v;
-  }
-  return undefined;
+export function deletionClaimIsActive(claim: R2Object, now = Date.now()): boolean {
+  const configured = Number(claim.customMetadata?.expiresAt);
+  const expiresAt = Number.isFinite(configured) ? configured : claim.uploaded.getTime() + DELETION_CLAIM_MAX_AGE_MS;
+  return expiresAt > now;
 }
 
 async function resolveUuidPointerIfNeeded(
@@ -63,21 +55,16 @@ async function resolveUuidPointerIfNeeded(
   digest: string,
   obj: R2ObjectBody,
 ): Promise<{ stream: ReadableStream; size: number; digest: string }> {
-  // legacy compat: some blobs were stored as a uuid pointer to a top-level object key
-  for (const k of META_REFERENCE_KEYS) {
-    const ref = getCustomMetadataCaseInsensitive(obj, k);
-    if (ref && UUID_RE.test(ref.trim())) {
-      const target = await env.REGISTRY.get(ref.trim());
-      if (target) {
-        // avoid leaking the original body stream when we return the referenced object
-        try {
-          await obj.body?.cancel();
-        } catch {
-          // ok whatever
-        }
-        return { stream: target.body!, size: target.size, digest };
+  const metadataReference = getRegistryReferenceFromMetadata(obj);
+  if (metadataReference) {
+    const target = await env.REGISTRY.get(metadataReference);
+    if (target) {
+      try {
+        await obj.body?.cancel();
+      } catch {
+        // body cancellation is best-effort
       }
-      break;
+      return { stream: target.body!, size: target.size, digest };
     }
   }
 
@@ -86,15 +73,13 @@ async function resolveUuidPointerIfNeeded(
   }
 
   const buf = await obj.arrayBuffer();
-  const text = new TextDecoder().decode(buf).trim();
-  if (!UUID_RE.test(text)) {
-    // not a pointer, just return the original bytes
+  const reference = parseRegistryReference(new TextDecoder().decode(buf));
+  if (!reference) {
     return { stream: new Blob([buf]).stream(), size: buf.byteLength, digest };
   }
 
-  const target = await env.REGISTRY.get(text);
+  const target = await env.REGISTRY.get(reference);
   if (!target) {
-    // pointer is dangling, fall back to returning the pointer bytes so callers can debug
     return { stream: new Blob([buf]).stream(), size: buf.byteLength, digest };
   }
 
@@ -345,10 +330,28 @@ export class R2Registry implements Registry {
   private gc: GarbageCollector;
 
   constructor(private env: Env) {
-    this.gc = new GarbageCollector(this.env.REGISTRY);
+    const configuredMinimumAge = Number(this.env.GC_MINIMUM_OBJECT_AGE_MS);
+    const minimumObjectAgeMs =
+      Number.isFinite(configuredMinimumAge) && configuredMinimumAge >= 0
+        ? configuredMinimumAge
+        : DEFAULT_GC_MINIMUM_OBJECT_AGE_MS;
+    this.gc = new GarbageCollector(this.env.REGISTRY, minimumObjectAgeMs);
+  }
+
+  private deletionClaimKey(name: string, reference: string): string {
+    return `${name}/deletion-claims/${reference}`;
+  }
+
+  private async getDeletionClaim(name: string, reference: string): Promise<R2Object | null> {
+    const claim = await this.env.REGISTRY.head(this.deletionClaimKey(name, reference));
+    if (!claim || !deletionClaimIsActive(claim)) return null;
+    return claim;
   }
 
   async manifestExists(name: string, reference: string): Promise<RegistryError | CheckManifestResponse> {
+    if (!reference.startsWith("sha256:") && (await this.getDeletionClaim(name, reference))) {
+      return { response: new Response("manifest tag is pending deletion", { status: 423 }) };
+    }
     const [res, err] = await wrap(this.env.REGISTRY.head(`${name}/manifests/${reference}`));
     if (err) {
       return wrapError("manifestExists", err);
@@ -517,6 +520,83 @@ export class R2Registry implements Registry {
     }
   }
 
+  async claimManifestTag(name: string, reference: string, expectedDigest: string): Promise<ManifestTagClaimResponse> {
+    return this.gc.withGarbageCollectionLock(name, async () => {
+      const claimKey = this.deletionClaimKey(name, reference);
+      const existingClaim = await this.env.REGISTRY.head(claimKey);
+      if (existingClaim && deletionClaimIsActive(existingClaim)) {
+        return { claimed: false, reason: "already_claimed" };
+      }
+      if (existingClaim) await this.env.REGISTRY.delete(claimKey);
+
+      const object = await this.env.REGISTRY.head(`${name}/manifests/${reference}`);
+      if (!object) return { claimed: false, reason: "not_found" };
+      if (!object.checksums.sha256) {
+        throw new ServerError("manifest is missing its sha256 checksum");
+      }
+      if (hexToDigest(object.checksums.sha256) !== expectedDigest) {
+        return { claimed: false, reason: "digest_mismatch" };
+      }
+
+      const token = crypto.randomUUID();
+      await this.env.REGISTRY.put(claimKey, token, {
+        customMetadata: {
+          token,
+          digest: expectedDigest,
+          expiresAt: (Date.now() + DELETION_CLAIM_MAX_AGE_MS).toString(),
+        },
+      });
+      return { claimed: true, token };
+    });
+  }
+
+  async releaseManifestTagClaim(name: string, reference: string, token: string): Promise<boolean> {
+    return this.gc.withGarbageCollectionLock(name, async () => {
+      const claim = await this.getDeletionClaim(name, reference);
+      if (!claim || claim.customMetadata?.token !== token) return false;
+      await this.env.REGISTRY.delete(claim.key);
+      return true;
+    });
+  }
+
+  async deleteManifestTag(
+    name: string,
+    reference: string,
+    expectedDigest?: string,
+    claimToken?: string,
+  ): Promise<DeleteManifestTagResponse> {
+    return this.gc.withGarbageCollectionLock(name, async () => {
+      const claim = await this.getDeletionClaim(name, reference);
+      if (claim && (!claimToken || claim.customMetadata?.token !== claimToken)) {
+        return { deleted: false, reason: "claim_mismatch" };
+      }
+      if (claimToken && !claim) return { deleted: false, reason: "claim_mismatch" };
+
+      const object = await this.env.REGISTRY.head(`${name}/manifests/${reference}`);
+      if (!object) {
+        if (claim) {
+          await this.env.REGISTRY.delete(claim.key);
+          return { deleted: true };
+        }
+        return { deleted: false, reason: "not_found" };
+      }
+      if (!object.checksums.sha256) {
+        throw new ServerError("manifest is missing its sha256 checksum");
+      }
+
+      const digest = hexToDigest(object.checksums.sha256);
+      if (expectedDigest && digest !== expectedDigest) {
+        return { deleted: false, reason: "digest_mismatch" };
+      }
+      if (claim && claim.customMetadata?.digest !== digest) {
+        return { deleted: false, reason: "digest_mismatch" };
+      }
+
+      await this.env.REGISTRY.delete(claim ? [object.key, claim.key] : object.key);
+      return { deleted: true };
+    });
+  }
+
   async putManifestInner(
     name: string,
     reference: string,
@@ -536,6 +616,9 @@ export class R2Registry implements Registry {
     const text = await blob.text();
     const manifestJSON = JSON.parse(text);
     const manifest = manifestSchema.parse(manifestJSON);
+    if (reference !== digestStr && (await this.getDeletionClaim(name, reference))) {
+      return { response: new ServerError("manifest tag is pending deletion", 409) };
+    }
     const verifyManifestErr = await this.verifyManifest(name, manifest);
     if (verifyManifestErr !== null) return { response: verifyManifestErr };
 
@@ -572,6 +655,9 @@ export class R2Registry implements Registry {
   }
 
   async getManifest(name: string, reference: string): Promise<RegistryError | GetManifestResponse> {
+    if (!reference.startsWith("sha256:") && (await this.getDeletionClaim(name, reference))) {
+      return { response: new Response("manifest tag is pending deletion", { status: 423 }) };
+    }
     const [res, err] = await wrap(this.env.REGISTRY.get(`${name}/manifests/${reference}`));
     if (err) {
       return wrapError("getManifest", err);
@@ -1191,8 +1277,11 @@ export class R2Registry implements Registry {
     };
   }
 
-  async garbageCollection(namespace: string, mode: GarbageCollectionMode): Promise<boolean> {
-    const result = await this.gc.collect({ name: namespace, mode: mode });
-    return result;
+  async garbageCollection(
+    namespace: string,
+    mode: GarbageCollectionMode,
+    options?: { dryRun?: boolean; excludedReferences?: string[] },
+  ) {
+    return this.gc.collect({ name: namespace, mode, ...options });
   }
 }

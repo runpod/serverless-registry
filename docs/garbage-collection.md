@@ -37,30 +37,43 @@ will still be around taking space.
 
 ## Removing an image and triggering the garbage collection
 
-To delete an image of your registry, you can use `skopeo delete` or an API call:
+To delete an image tag, use `skopeo delete` or an API call. Maintenance clients can include the inventory digest so deletion fails if the tag points to different content.
 
 ```
 # If you pushed to serverless.workers.dev/my-image:latest
-curl -X DELETE -X "Authorization: $CREDENTIAL" https://serverless.workers.dev/my-image/manifests/latest
-# You will also need to remove the digest reference
-curl -X DELETE -X "Authorization: $CREDENTIAL" https://serverless.workers.dev/my-image/manifests/<digest>
+curl -X DELETE \
+  -H "Authorization: $CREDENTIAL" \
+  -H "X-Runpod-Expected-Digest: sha256:..." \
+  https://serverless.workers.dev/my-image/manifests/latest
 ```
 
-The layer still exists in the registry, but we can remove it by triggering the garbage collector.
+Maintenance cleanup first claims a tag with its inventory digest. Claimed tags reject reads and writes while the caller revalidates external references, and claims expire after 15 minutes if a caller stops before releasing or deleting them. Final deletion requires both the claim token and the same digest.
+
+The digest manifest and unreferenced layers can then be reclaimed with untagged garbage collection.
 
 ```
-curl -X POST -H "Authorization: $CREDENTIAL" https://serverless.workers.dev/my-image/gc
-{"success":true}
+curl -X POST -H "Authorization: $CREDENTIAL" "https://serverless.workers.dev/my-image/gc?mode=untagged"
+{"success":true,"objectCount":4,"bytes":128000}
 ```
+
+A dry run calculates the objects and bytes that would be reclaimed after removing a bounded set of tags. It does not mutate registry data.
+
+```
+curl -X POST \
+  -H "Authorization: $CREDENTIAL" \
+  -H "Content-Type: application/json" \
+  -d '{"references":["latest","previous"]}' \
+  "https://serverless.workers.dev/my-image/gc?mode=untagged&dry_run=true"
+{"success":true,"objectCount":8,"bytes":256000}
+```
+
+Objects uploaded within the last hour and blobs attached to active direct uploads remain available for in-progress pushes.
 
 ## How does it work
 
-How do we remove them? We take the approach of listing all manifests in a namespace and storing its digests
-in a Set, then we list all the layers and those that are not in the Set get removed. That has a big drawback
-that means we might be removing layers that don't have a manifest but are about to have one at the end of their push.
+Reachability is evaluated in bounded memory with conservative Bloom filters. Tagged and recent manifests seed the live set, and bounded passes propagate reachability through OCI indexes, subjects, and referrers. Bloom-filter false positives retain extra objects, so they cannot cause live data to be reclaimed. Manifest bodies are processed one at a time.
 
-In serverless-registry, if we remove a layer garbage collecting the manifest endpoint will throw a BLOB_UNKNOWN
-error, but the garbage collector can still race with that endpont, so we go back to square one.
+Live manifests seed another bounded filter for configs and layers. Active uploads and legacy pointer targets are added before unreferenced objects are processed in bounded deletion batches.
 
 Some registries take a lock stop the world approach, however serverless-registry can't really do that due
 to its objective of only using R2. However, we need to fail whenever a race condition happens, a data
@@ -71,8 +84,7 @@ that we are about to create a manifest and that we are inserting data.
 If the garbage collector starts and sees that key, it will fail. At the end of the insertion, the insertion mark
 gets updated.
 
-The same goes for the garbage collector, when it starts it creates a mark, and when it finishes it updates the
-mark.
+The garbage collector acquires a 15-minute lease and renews it before each deletion batch. Lease updates are conditional on the current object ETag, so a stale process cannot renew or release a newer collector's lease. Expired leases can be claimed by a later run.
 
 Let's state some scenarios:
 
