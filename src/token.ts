@@ -6,6 +6,7 @@ import {
   stripUsernamePasswordFromHeader,
   Authenticator,
 } from "./auth";
+import v2Router from "./router";
 
 export function importKeyFromBase64(key: string): string {
   // Decodes the base64 value and performs unicode normalization.
@@ -254,32 +255,32 @@ export class RegistryTokens implements Authenticator {
   }
 }
 
-const REPOSITORY_PATH_PREFIXES = ["/v2/", "/v2/_maintenance/"];
-
-// Route tails (everything after "<name>/") that an image-scoped token may reach.
-// Variable segments are [^/]+ so the tail can't contain another route keyword:
-// the router captures :name+ greedily, so "/v2/a/manifests/x/manifests/y" routes
-// to repository "a/manifests/x". Pinning the tail shape keeps the name we check
-// identical to the name the router hands to the handler.
-const SCOPED_ROUTE_TAIL =
-  /^(manifests\/[^/]+|blobs\/[^/]+|blobs\/uploads\/[^/]*|tags|tags\/list|tags\/[^/]+\/claim|gc)$/;
+/**
+ * Returns the repository name the v2 router will dispatch this request to, or
+ * undefined when the matching route has no repository (or nothing matches).
+ *
+ * Walks v2Router's own route table with the same rules itty-router uses (method
+ * or ALL, first match wins, regex against the raw pathname), so method, route
+ * precedence and the greedy :name+ capture can't drift from real dispatch.
+ */
+const routedRepositoryName = (request: Request): string | undefined => {
+  const { pathname } = new URL(request.url);
+  for (const [method, pattern] of v2Router.routes) {
+    if (method !== request.method && method !== "ALL") continue;
+    const match = pathname.match(pattern);
+    if (match) return match.groups?.name;
+  }
+  return undefined;
+};
 
 /**
  * Checks that an image-scoped token only reaches its own repository.
  *
- * Authentication runs before routing, so req.params.name isn't available yet.
- * The repository name is read from URL.pathname (never the full URL: the query
- * string is attacker-controlled and isn't used for routing) and must equal
+ * Authentication runs before routing, so req.params.name isn't available yet;
+ * the routed name is resolved from the route table instead and must equal
  * payload.imageName exactly. Tokens without imageName are not image-scoped.
  */
 const checkHasPermissionToImage = (payload: RegistryAuthProtocolTokenPayload, request: Request) => {
   if (!payload?.imageName) return true;
-  const { pathname } = new URL(request.url);
-  for (const prefix of REPOSITORY_PATH_PREFIXES) {
-    const repositoryPrefix = `${prefix}${payload.imageName}/`;
-    if (pathname.startsWith(repositoryPrefix)) {
-      return SCOPED_ROUTE_TAIL.test(pathname.slice(repositoryPrefix.length));
-    }
-  }
-  return false;
+  return routedRepositoryName(request) === payload.imageName;
 };

@@ -786,7 +786,7 @@ describe("tokens", async () => {
     const scopedTo = (imageName: string) =>
       ({ capabilities: allCapabilities, imageName }) as RegistryAuthProtocolTokenPayload;
 
-    const denied: { name: string; method: string; path: string }[] = [
+    const denied: { name: string; method: string; path: string; imageName?: string }[] = [
       { name: "image name smuggled in query string", method: "PUT", path: "/v2/victim/manifests/latest?x=/evil" },
       { name: "bare image name as query string", method: "PUT", path: "/v2/victim/manifests/latest?evil" },
       { name: "query string on blob upload", method: "PATCH", path: "/v2/victim/blobs/uploads/abc?/evil" },
@@ -800,11 +800,23 @@ describe("tokens", async () => {
       { name: "catalog", method: "GET", path: "/v2/_catalog?evil" },
       { name: "maintenance inventory", method: "GET", path: "/v2/_maintenance/repositories?/evil" },
       { name: "repository root without a route", method: "GET", path: "/v2/evil" },
+      { name: "gc route reached through a manifests tail", method: "POST", path: "/v2/evil/manifests/gc" },
+      {
+        name: "manifest route under the maintenance prefix",
+        method: "PUT",
+        path: "/v2/_maintenance/evil/manifests/latest",
+      },
+      {
+        name: "maintenance claim from a token scoped to the maintenance-prefixed name",
+        method: "POST",
+        path: "/v2/_maintenance/evil/tags/build/claim",
+        imageName: "_maintenance/evil",
+      },
     ];
 
-    for (const { name, method, path } of denied) {
+    for (const { name, method, path, imageName = "evil" } of denied) {
       test(`denies ${name}: ${method} ${path}`, () => {
-        const { verified } = RegistryTokens.verifyPayload(createRequest(method, path, null), scopedTo("evil"));
+        const { verified } = RegistryTokens.verifyPayload(createRequest(method, path, null), scopedTo(imageName));
         expect(verified).toBeFalsy();
       });
     }
