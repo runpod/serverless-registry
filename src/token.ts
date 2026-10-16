@@ -6,6 +6,7 @@ import {
   stripUsernamePasswordFromHeader,
   Authenticator,
 } from "./auth";
+import v2Router from "./router";
 
 export function importKeyFromBase64(key: string): string {
   // Decodes the base64 value and performs unicode normalization.
@@ -254,18 +255,32 @@ export class RegistryTokens implements Authenticator {
   }
 }
 
+/**
+ * Returns the repository name the v2 router will dispatch this request to, or
+ * undefined when the matching route has no repository (or nothing matches).
+ *
+ * Walks v2Router's own route table with the same rules itty-router uses (method
+ * or ALL, first match wins, regex against the raw pathname), so method, route
+ * precedence and the greedy :name+ capture can't drift from real dispatch.
+ */
+const routedRepositoryName = (request: Request): string | undefined => {
+  const { pathname } = new URL(request.url);
+  for (const [method, pattern] of v2Router.routes) {
+    if (method !== request.method && method !== "ALL") continue;
+    const match = pathname.match(pattern);
+    if (match) return match.groups?.name;
+  }
+  return undefined;
+};
+
+/**
+ * Checks that an image-scoped token only reaches its own repository.
+ *
+ * Authentication runs before routing, so req.params.name isn't available yet;
+ * the routed name is resolved from the route table instead and must equal
+ * payload.imageName exactly. Tokens without imageName are not image-scoped.
+ */
 const checkHasPermissionToImage = (payload: RegistryAuthProtocolTokenPayload, request: Request) => {
-  // if the token isn't scoped to an image, don't enforce image matching
   if (!payload?.imageName) return true;
-  const split = request.url.split("/");
-  let hasImageName = false;
-  for (const part of split) {
-    if (part === payload?.imageName) {
-      hasImageName = true;
-    }
-  }
-  if (!hasImageName) {
-    return false;
-  }
-  return true;
+  return routedRepositoryName(request) === payload.imageName;
 };
