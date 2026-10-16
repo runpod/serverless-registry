@@ -254,18 +254,32 @@ export class RegistryTokens implements Authenticator {
   }
 }
 
+const REPOSITORY_PATH_PREFIXES = ["/v2/", "/v2/_maintenance/"];
+
+// Route tails (everything after "<name>/") that an image-scoped token may reach.
+// Variable segments are [^/]+ so the tail can't contain another route keyword:
+// the router captures :name+ greedily, so "/v2/a/manifests/x/manifests/y" routes
+// to repository "a/manifests/x". Pinning the tail shape keeps the name we check
+// identical to the name the router hands to the handler.
+const SCOPED_ROUTE_TAIL =
+  /^(manifests\/[^/]+|blobs\/[^/]+|blobs\/uploads\/[^/]*|tags|tags\/list|tags\/[^/]+\/claim|gc)$/;
+
+/**
+ * Checks that an image-scoped token only reaches its own repository.
+ *
+ * Authentication runs before routing, so req.params.name isn't available yet.
+ * The repository name is read from URL.pathname (never the full URL: the query
+ * string is attacker-controlled and isn't used for routing) and must equal
+ * payload.imageName exactly. Tokens without imageName are not image-scoped.
+ */
 const checkHasPermissionToImage = (payload: RegistryAuthProtocolTokenPayload, request: Request) => {
-  // if the token isn't scoped to an image, don't enforce image matching
   if (!payload?.imageName) return true;
-  const split = request.url.split("/");
-  let hasImageName = false;
-  for (const part of split) {
-    if (part === payload?.imageName) {
-      hasImageName = true;
+  const { pathname } = new URL(request.url);
+  for (const prefix of REPOSITORY_PATH_PREFIXES) {
+    const repositoryPrefix = `${prefix}${payload.imageName}/`;
+    if (pathname.startsWith(repositoryPrefix)) {
+      return SCOPED_ROUTE_TAIL.test(pathname.slice(repositoryPrefix.length));
     }
   }
-  if (!hasImageName) {
-    return false;
-  }
-  return true;
+  return false;
 };

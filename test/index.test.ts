@@ -781,6 +781,66 @@ describe("tokens", async () => {
     expect(verified).toBeTruthy();
   });
 
+  describe("image-scoped token must match the routed repository exactly", () => {
+    const allCapabilities: RegistryAuthProtocolTokenPayload["capabilities"] = ["pull", "push", "delete"];
+    const scopedTo = (imageName: string) =>
+      ({ capabilities: allCapabilities, imageName }) as RegistryAuthProtocolTokenPayload;
+
+    const denied: { name: string; method: string; path: string }[] = [
+      { name: "image name smuggled in query string", method: "PUT", path: "/v2/victim/manifests/latest?x=/evil" },
+      { name: "bare image name as query string", method: "PUT", path: "/v2/victim/manifests/latest?evil" },
+      { name: "query string on blob upload", method: "PATCH", path: "/v2/victim/blobs/uploads/abc?/evil" },
+      { name: "query string on gc", method: "POST", path: "/v2/victim/gc?/evil" },
+      { name: "tag reference equals image name", method: "PUT", path: "/v2/victim/manifests/evil" },
+      { name: "upload id equals image name", method: "PATCH", path: "/v2/victim/blobs/uploads/evil" },
+      { name: "image name as trailing repo segment", method: "PUT", path: "/v2/victim/evil/manifests/latest" },
+      { name: "image name as leading repo segment", method: "PUT", path: "/v2/evil/victim/manifests/latest" },
+      { name: "extra route keyword widens the routed name", method: "PUT", path: "/v2/evil/manifests/a/manifests/b" },
+      { name: "maintenance claim on another repo", method: "DELETE", path: "/v2/_maintenance/victim/tags/evil/claim" },
+      { name: "catalog", method: "GET", path: "/v2/_catalog?evil" },
+      { name: "maintenance inventory", method: "GET", path: "/v2/_maintenance/repositories?/evil" },
+      { name: "repository root without a route", method: "GET", path: "/v2/evil" },
+    ];
+
+    for (const { name, method, path } of denied) {
+      test(`denies ${name}: ${method} ${path}`, () => {
+        const { verified } = RegistryTokens.verifyPayload(createRequest(method, path, null), scopedTo("evil"));
+        expect(verified).toBeFalsy();
+      });
+    }
+
+    const digest = "sha256:" + "a".repeat(64);
+    const allowed: { imageName: string; method: string; path: string }[] = [
+      { imageName: "evil", method: "HEAD", path: `/v2/evil/blobs/${digest}` },
+      { imageName: "evil", method: "GET", path: `/v2/evil/blobs/${digest}` },
+      { imageName: "evil", method: "HEAD", path: "/v2/evil/manifests/latest" },
+      { imageName: "evil", method: "GET", path: "/v2/evil/manifests/latest" },
+      { imageName: "evil", method: "PUT", path: "/v2/evil/manifests/latest" },
+      { imageName: "evil", method: "POST", path: "/v2/evil/blobs/uploads/" },
+      { imageName: "evil", method: "POST", path: "/v2/evil/blobs/uploads/direct" },
+      { imageName: "evil", method: "GET", path: "/v2/evil/blobs/uploads/some-uuid" },
+      { imageName: "evil", method: "PATCH", path: "/v2/evil/blobs/uploads/some-uuid" },
+      { imageName: "evil", method: "PUT", path: `/v2/evil/blobs/uploads/some-uuid?digest=${digest}` },
+      { imageName: "evil", method: "DELETE", path: "/v2/evil/blobs/uploads/some-uuid" },
+      { imageName: "evil", method: "GET", path: "/v2/evil/tags/list?n=10" },
+      { imageName: "evil", method: "DELETE", path: `/v2/evil/manifests/${digest}` },
+      { imageName: "evil", method: "DELETE", path: `/v2/evil/blobs/${digest}` },
+      { imageName: "evil", method: "POST", path: "/v2/evil/gc" },
+      { imageName: "evil", method: "GET", path: "/v2/_maintenance/evil/tags" },
+      { imageName: "evil", method: "POST", path: "/v2/_maintenance/evil/tags/build/claim" },
+      { imageName: "evil", method: "GET", path: "/v2/" },
+      // proxy mints pull tokens with the full path after registry.runpod.net/
+      { imageName: "runpod/worker-comfyui", method: "GET", path: "/v2/runpod/worker-comfyui/manifests/latest" },
+    ];
+
+    for (const { imageName, method, path } of allowed) {
+      test(`allows ${imageName} token: ${method} ${path}`, () => {
+        const { verified } = RegistryTokens.verifyPayload(createRequest(method, path, null), scopedTo(imageName));
+        expect(verified).toBeTruthy();
+      });
+    }
+  });
+
   test("auth payload pull on /v2/whatever with mutations", async () => {
     for (const mutationMethod of ["PATCH", "POST", "DELETE"]) {
       const { verified } = RegistryTokens.verifyPayload(createRequest(mutationMethod, "/v2/whatever", null), {
