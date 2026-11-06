@@ -90,6 +90,27 @@ In the wrangler.toml file:
 REGISTRIES_JSON = "[{ \"registry\": \"https://url-to-other-registry\", \"password_env\": \"REGISTRY_TOKEN\", \"username\": \"username-to-use\" }]"
 ```
 
+#### Token realm allowlist
+
+The upstream registry tells the client where to fetch a token (the `realm`
+in its `WWW-Authenticate` header), and the configured credential is sent there.
+To stop a compromised or intercepted upstream from redirecting the credential
+elsewhere, the realm must be one of:
+
+- the registry host itself (for example `ghcr.io`, `gcr.io`, `*-docker.pkg.dev`, `quay.io`),
+- `auth.docker.io`, when the registry is `registry-1.docker.io`, `index.docker.io` or `docker.io`,
+- a host listed in the optional `auth_realm_hosts` field.
+
+Realms must use `https` (plain `http` is accepted only when the configured
+registry itself is `http` and the realm is on the same host and port), must not
+contain userinfo, a custom port or an IP address, and token requests never follow
+redirects. A rejected realm fails the request and no credential is sent.
+For a registry whose token service is on another host, list that host:
+
+```
+REGISTRIES_JSON = "[{ \"registry\": \"https://registry.gitlab.com/group\", \"password_env\": \"REGISTRY_TOKEN\", \"username\": \"user\", \"auth_realm_hosts\": [\"gitlab.com\"] }]"
+```
+
 Set as a secret the registry token of the registry you want to setup
 pull fallback in.
 

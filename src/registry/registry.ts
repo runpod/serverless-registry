@@ -4,11 +4,24 @@ import { errorString } from "../utils";
 import z from "zod";
 import { GarbageCollectionMode, GarbageCollectionResult } from "./garbage-collector";
 
+const HOSTNAME_PATTERN = /^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
+
+// A bare DNS hostname: no scheme, port, path, userinfo, wildcard or IP literal.
+const realmHostname = z
+  .string()
+  .trim()
+  .toLowerCase()
+  .regex(HOSTNAME_PATTERN, "expected a bare hostname")
+  .refine((host) => !/^[0-9.]+$/.test(host), "IP addresses are not allowed");
+
 // Defines a registry and how it's configured
 const registryConfiguration = z.object({
   registry: z.string().url(),
   password_env: z.string(),
   username: z.string(),
+  // Extra hosts, besides the registry host, that may serve this registry's token realm
+  // (for example "gitlab.com" for registry.gitlab.com). Credentials are only ever sent to these hosts.
+  auth_realm_hosts: realmHostname.array().optional(),
 });
 
 export type RegistryConfiguration = z.infer<typeof registryConfiguration>;

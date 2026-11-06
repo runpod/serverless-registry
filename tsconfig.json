@@ -1,5 +1,5 @@
 {
   "extends": "./tsconfig.base.json",
-  "include": ["src/**/*.ts", "index.ts", "test/index.test.ts"],
+  "include": ["src/**/*.ts", "index.ts", "test/index.test.ts", "test/registry-http-auth.test.ts"],
   "exclude": ["src/**/*.js", "dist/**/*.ts", "test/vitest.config.ts"]
 }

@@ -2,6 +2,7 @@ import { Env } from "../..";
 import { InternalError } from "../errors";
 import { errorString } from "../utils";
 import { GarbageCollectionMode, GarbageCollectionResult } from "./garbage-collector";
+import { assertRealmAllowed } from "./realm";
 import {
   CheckLayerResponse,
   CheckManifestResponse,
@@ -66,9 +67,9 @@ function ctxIntoHeaders(ctx: HTTPContext): Headers {
 }
 
 function ctxIntoRequest(ctx: HTTPContext, url: URL, method: string, path: string, body?: BodyInit): Request {
-  const urlReq = `${url.protocol}//${ctx.authContext.service}/v2${
-    ctx.repository === "" ? "/" : ctx.repository + "/"
-  }${path}`;
+  // Always the configured registry host: the challenge's service attribute is attacker-influenced
+  // and these requests carry the access token or basic credentials.
+  const urlReq = `${url.protocol}//${url.host}/v2${ctx.repository === "" ? "/" : ctx.repository + "/"}${path}`;
   return new Request(urlReq, {
     method,
     body,
@@ -208,10 +209,18 @@ export class RegistryHTTPClient implements Registry {
     return false;
   }
 
+  // Fails closed when the advertised realm is not the registry host or an allowed realm host.
+  private validatedRealm(ctx: AuthContext): string {
+    return assertRealmAllowed(ctx.realm, this.url, this.configuration.auth_realm_hosts).toString();
+  }
+
   async authenticateBearerSimple(ctx: AuthContext, params: URLSearchParams): Promise<Response> {
+    const realm = this.validatedRealm(ctx);
     params.delete("password");
-    console.log("sending authentication parameters:", ctx.realm + "?" + params.toString());
-    return await fetch(ctx.realm + "?" + params.toString(), {
+    console.log("sending authentication parameters:", realm + "?" + params.toString());
+    return await fetch(realm + "?" + params.toString(), {
+      // A redirect would forward the credentials to a host that was never validated.
+      redirect: "manual",
       headers: {
         "Authorization": "Basic " + this.authBase64(),
         "Accept": "application/json",
@@ -221,6 +230,7 @@ export class RegistryHTTPClient implements Registry {
   }
 
   async authenticateBearer(ctx: AuthContext): Promise<HTTPContext> {
+    const realm = this.validatedRealm(ctx);
     const params = new URLSearchParams({
       service: ctx.service,
       // explicitely include that we don't want an offline_token.
@@ -229,7 +239,8 @@ export class RegistryHTTPClient implements Registry {
       grant_type: "password",
       password: this.password(),
     });
-    let response = await fetch(ctx.realm, {
+    let response = await fetch(realm, {
+      redirect: "manual",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
         "User-Agent": "Docker-Client/24.0.5 (linux)",
@@ -295,7 +306,9 @@ export class RegistryHTTPClient implements Registry {
   }
 
   async authenticateBasic(ctx: AuthContext): Promise<HTTPContext> {
-    const res = await fetch(ctx.realm, {
+    const realm = this.validatedRealm(ctx);
+    const res = await fetch(realm, {
+      redirect: "manual",
       headers: {
         Authorization: "Basic " + this.authBase64(),
       },
